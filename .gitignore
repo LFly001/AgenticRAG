@@ -1,0 +1,62 @@
+# ============================================================
+# 多 Agent RAG 系统 — Git 忽略规则
+# ============================================================
+
+# --- Python 缓存与编译产物 ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# --- 虚拟环境 ---
+venv/
+.venv/
+env/
+
+# --- 环境变量（含 API Key，绝对不能提交）---
+.env
+.env.local
+.env.production
+
+# --- IDE 与编辑器 ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- 模型文件（过大，通过 volume 挂载或单独下载）---
+ml_models/
+!ml_models/.gitkeep
+
+# --- 向量数据库（运行时生成）---
+chroma_db/
+
+# --- 上传文件（运行时数据）---
+data/
+
+# --- NLTK 数据（通过脚本下载）---
+nltk_data/
+
+# --- Redis 持久化 ---
+redis_data/
+
+# --- HuggingFace 缓存 ---
+hf_cache/
+
+# --- 日志 ---
+*.log
+logs/
+
+# --- Docker 相关（不需要提交）---
+# Dockerfile、docker-compose.yml、.dockerignore 提交即可
+# 以下忽略：
+docker-compose.override.yml
+
+# --- OS 文件 ---
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,74 @@
+# ============================================================
+# Docker 构建忽略文件
+# ============================================================
+
+# --- Python 缓存与编译产物 ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# --- 虚拟环境 ---
+venv/
+.venv/
+env/
+.env
+
+# --- IDE 与编辑器 ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Git ---
+.git/
+.gitignore
+.gitattributes
+
+# --- 模型文件（通过 volume 挂载，不打包进镜像）---
+ml_models/
+# 保留 ml_models 目录结构
+!ml_models/.gitkeep
+
+# --- 向量数据库（通过 volume 挂载）---
+chroma_db/
+
+# --- 上传文件（通过 volume 挂载）---
+data/
+
+# --- NLTK 数据（通过 volume 挂载）---
+nltk_data/
+
+# --- Redis 持久化 ---
+redis_data/
+
+# --- 文档与说明 ---
+README.md
+*.md
+!CLAUDE.md
+
+# --- Docker 相关 ---
+.dockerignore
+docker-compose*.yml
+Dockerfile*
+
+# --- 环境变量（使用 .env.example 或运行时注入）---
+.env
+.env.local
+
+# --- 测试与评估 ---
+eval/
+tests/
+
+# --- 日志 ---
+*.log
+logs/
+
+# --- OS 文件 ---
+.DS_Store
+Thumbs.db
+desktop.ini

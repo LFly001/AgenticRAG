@@ -1,0 +1,175 @@
+# ============================================================
+# 多 Agent 协作智能知识库 — Docker Compose 编排
+# ============================================================
+#
+# 服务架构：
+#   - backend:  FastAPI 后端（5-Agent 协作图）
+#   - frontend: Streamlit Web 前端
+#   - redis:    Redis — 父文档缓存 + 多轮对话记忆
+#
+# 前置准备：
+#   1. 复制 .env.example 为 .env 并填入真实的 API Key
+#   2. 下载所需模型到 ./ml_models/ 目录（见下方说明）
+#   3. 如果模型未下载，entrypoint.sh 会在首次启动时自动下载
+#
+# 模型准备（二选一）：
+#   方式 A — 宿主机预下载（推荐）：
+#     git lfs install
+#     git clone https://huggingface.co/BAAI/bge-m3 ml_models/bge-m3
+#     git clone https://huggingface.co/BAAI/bge-reranker-v2-m3 ml_models/bge-reranker-v2-m3
+#
+#   方式 B — 容器自动下载（首次启动较慢）：
+#     设置环境变量 HF_ENDPOINT=https://hf-mirror.com（国内用户）
+#     启动后 entrypoint.sh 会自动检测并下载缺失模型
+#
+# 常用命令：
+#   docker compose up -d          # 后台启动所有服务
+#   docker compose logs -f        # 查看所有日志
+#   docker compose logs -f backend # 仅查看后端日志
+#   docker compose down           # 停止并删除容器
+#   docker compose down -v        # 同时删除数据卷（ChromaDB、Redis 数据）
+#
+# 访问地址：
+#   Web 界面: http://localhost:8501
+#   API 文档: http://localhost:8000/docs
+# ============================================================
+
+services:
+  # ==========================================
+  # FastAPI 后端（多 Agent 协作引擎）
+  # ==========================================
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # 模型文件（BGE-M3、BGE-Reranker 等）— 只读挂载，避免容器内误改
+      - ./ml_models:/app/ml_models:ro
+      # ChromaDB 向量数据库持久化
+      - ./chroma_db:/app/chroma_db
+      # 上传文件暂存目录
+      - ./data:/app/data
+      # NLTK 数据（避免每次重建镜像时重复下载）
+      - ./nltk_data:/app/nltk_data
+      # HuggingFace 缓存（独立可写，与只读模型目录分离）
+      - ./hf_cache:/app/hf_cache
+    environment:
+      # === LLM (DeepSeek) ===
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
+      - LLM_MODEL_NAME=${LLM_MODEL_NAME:-deepseek-chat}
+
+      # === 嵌入模型 (BGE-M3 本地) ===
+      - LOCAL_EMBEDDING_PATH=${LOCAL_EMBEDDING_PATH:-./ml_models/bge-m3}
+
+      # === HuggingFace 镜像（国内用户取消注释以加速）===
+      - HF_ENDPOINT=${HF_ENDPOINT:-}
+      - HF_HOME=/app/hf_cache
+
+      # === 重排序模型 ===
+      - RERANKER_MODEL_NAME=${RERANKER_MODEL_NAME:-./ml_models/bge-reranker-v2-m3}
+
+      # === ChromaDB ===
+      - CHROMA_PERSIST_DIR=${CHROMA_PERSIST_DIR:-./chroma_db}
+      - COLLECTION_NAME=${COLLECTION_NAME:-enterprise_knowledge}
+
+      # === 检索参数 ===
+      - TOP_K_RETRIEVAL=${TOP_K_RETRIEVAL:-20}
+      - TOP_K_RERANK=${TOP_K_RERANK:-5}
+      - RRF_K_CONSTANT=${RRF_K_CONSTANT:-60}
+      - BM25_WEIGHT=${BM25_WEIGHT:-0.5}
+      - VECTOR_WEIGHT=${VECTOR_WEIGHT:-0.5}
+
+      # === 切片参数 ===
+      - CHUNK_SIZE=${CHUNK_SIZE:-512}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-50}
+
+      # === Redis（Docker 内部网络）===
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+
+      # === NLTK ===
+      - NLTK_DATA=/app/nltk_data
+
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - rag-network
+
+  # ==========================================
+  # Redis 缓存服务
+  # ==========================================
+  redis:
+    image: redis:7-alpine
+    container_name: rag-redis
+    restart: unless-stopped
+    ports:
+      # 生产环境建议移除 ports 映射，仅允许内部网络访问
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - ./redis_data:/data
+    # Redis 启动命令：如果设置了密码则启用认证
+    command: >
+      sh -c "
+      if [ -n \"${REDIS_PASSWORD:-}\" ]; then
+        redis-server --appendonly yes --requirepass \"${REDIS_PASSWORD}\";
+      else
+        redis-server --appendonly yes;
+      fi
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - rag-network
+
+  # ==========================================
+  # Streamlit 前端服务
+  # ==========================================
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-frontend
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      # NLTK 数据共享，避免重复下载
+      - ./nltk_data:/app/nltk_data
+    environment:
+      # 前端通过 Docker 内部网络连接后端
+      - BACKEND_URL=http://backend:8000
+      - NLTK_DATA=/app/nltk_data
+      # 跳过模型检查（前端不需要模型）
+      - SKIP_MODEL_CHECK=true
+    # 覆盖 ENTRYPOINT，跳过模型下载检查，直接启动 Streamlit
+    entrypoint: []
+    command: >
+      streamlit run frontend/app.py
+      --server.port=8501
+      --server.address=0.0.0.0
+      --server.headless=true
+      --browser.gatherUsageStats=false
+    depends_on:
+      - backend
+    networks:
+      - rag-network
+
+# ==========================================
+# 网络配置
+# ==========================================
+networks:
+  rag-network:
+    driver: bridge
+    name: rag-network

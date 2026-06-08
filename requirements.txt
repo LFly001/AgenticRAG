@@ -1,0 +1,60 @@
+# Web Framework & High Performance Async Support
+fastapi==0.115.0
+uvicorn==0.30.6
+streamlit==1.38.0
+# Uvicorn 性能增强（Linux 环境自动启用）
+uvloop==0.20.0; sys_platform == 'linux'
+httptools==0.6.4
+
+# LangChain & Ecosystem
+langchain==0.3.7
+langchain-core==0.3.17
+langchain-text-splitters==0.3.2
+langchain-openai==0.2.3
+langchain-huggingface==0.1.2
+langchainhub==0.1.21  # 用于拉取 Agent Prompt 模板
+
+# LangGraph — 5-Agent 协作工作流引擎
+langgraph==0.2.45
+langgraph-checkpoint==2.0.8
+
+# Vector Database
+chromadb==1.5.8
+
+# Redis 支持（父文档上下文缓存 + 多轮对话记忆）
+redis==5.0.1
+
+# Embedding & LLM Core
+openai==1.58.1
+sentence-transformers==3.1.1
+
+# Document Parsing
+unstructured[docx]==0.16.8
+unstructured[pdf]==0.16.8
+unstructured-client==0.25.7
+markdownify==0.13.1
+sentencepiece==0.2.0
+tiktoken==0.8.0
+pdfminer.six==20231228
+
+# Evaluation
+ragas==0.2.7
+datasets==3.0.1
+
+# Utils & Core Dependencies
+python-dotenv==1.0.1
+pydantic==2.9.2
+pydantic-settings==2.6.0
+
+# BM25 Search & NLP
+bm25s==0.1.10
+jieba==0.42.1
+nltk==3.9.1
+
+# Data Science
+numpy==1.26.4
+pandas==2.2.3
+
+# Deep Learning Core
+torch==2.6.0
+transformers==4.45.2
