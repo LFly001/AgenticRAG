@@ -1,29 +1,23 @@
-"""RetrieverAgent 子图状态 — 检索专家的独立状态空间。"""
+"""RetrieveAgent 子图状态 — 检索调度节点的独立状态空间。"""
+
 from typing import TypedDict, List, Dict, Any
 
 
 class RetrieverState(TypedDict, total=False):
-    """RetrieverAgent 子图状态。
+    """RetrieveAgent 子图状态。
 
     字段说明：
-    - query: 当前要检索的查询文本（可能被 self_rewrite 修改）
-    - original_query: 用户原始查询（用于最终溯源和评估基准）
-    - strategy: 当前选择的检索策略（vector / bm25 / hybrid）
-    - documents: 当前检索到的文档列表
-    - attempt_count: 已执行检索尝试的次数
-    - max_attempts: 最大允许尝试次数（默认 3），防止无限循环
-    - agent_log: Agent 内部执行路径日志
-
-    内部路由信号（由 self_evaluate 写入，_route_after_evaluate 读取）：
-    - _verdict: "good" | "needs_improvement"
-    - _overall_score: 1-5 的整体检索质量评分
-    - _diagnosis: 诊断原因（irrelevant_results / too_few / outdated / other）
+    - query_list: 正常检索的子查询列表 [{query}, ...]
+    - re_retrieve_queries: 二次检索的查询列表（与 query_list 互斥，优先使用）
+    - _retrieve_results: 并行检索的原始结果（节点间内部传递）
+    - raw_docs: 并行检索 + RRF 融合 + 去重排序后的文档列表
+    - route_action: 下一跳路由标记
+    - agent_log: 执行日志
     """
 
-    query: str
-    original_query: str
-    strategy: str
-    documents: List[Dict[str, Any]]
-    attempt_count: int
-    max_attempts: int
+    query_list: List[Dict[str, Any]]
+    re_retrieve_queries: List[Dict[str, Any]]
+    _retrieve_results: List[Any]
+    raw_docs: List[Dict[str, Any]]
+    route_action: str
     agent_log: List[str]

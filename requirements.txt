@@ -14,7 +14,7 @@ langchain-openai==0.2.3
 langchain-huggingface==0.1.2
 langchainhub==0.1.21  # 用于拉取 Agent Prompt 模板
 
-# LangGraph — 5-Agent 协作工作流引擎
+# LangGraph — 8-Agent 协作工作流引擎
 langgraph==0.2.45
 langgraph-checkpoint==2.0.8
 

@@ -1,4 +1,4 @@
-"""混合检索器 — 向量检索 + BM25 关键词检索 + RRF 融合 + CrossEncoder 重排序。
+"""混合检索器 — 向量 + BM25 + RRF 融合 + CrossEncoder 重排序。
 
 入库逻辑已提取至 app.core.indexer.IndexingMixin。
 """
@@ -96,152 +96,17 @@ class HybridRetriever(IndexingMixin):
         self,
         query: str,
         top_k: Optional[int] = None,
-        strategy: str = "hybrid",
     ) -> List[Dict[str, Any]]:
-        """混合检索入口 — 支持按策略选择检索通道。
+        """混合检索 — 向量 + BM25 + RRF 融合 + CrossEncoder 重排序。
 
         Args:
             query: 查询文本
             top_k: 最终返回文档数（默认使用配置值）
-            strategy: "hybrid" | "vector" | "bm25"
         """
         if top_k is None:
             top_k = settings.TOP_K_RETRIEVAL
 
-        if strategy == "vector":
-            return await self._retrieve_vector(query, top_k)
-        elif strategy == "bm25":
-            return await self._retrieve_bm25(query, top_k)
-        else:
-            return await self._retrieve_hybrid(query, top_k)
-
-    # ========================================================================
-    # 向量检索
-    # ========================================================================
-
-    async def _retrieve_vector(
-        self, query: str, top_k: int
-    ) -> List[Dict[str, Any]]:
-        """纯向量语义检索 + 重排序。"""
-        loop = asyncio.get_running_loop()
-        query_embedding = await self.embedder.aembed_query(query)
-        count = self.collection.count()
-        if count == 0:
-            return []
-
-        n_results = min(top_k * 2, count)
-        vector_results = await loop.run_in_executor(
-            None,
-            lambda: self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=n_results,
-                include=["documents", "metadatas", "distances"],
-            ),
-        )
-
-        candidate_ids = vector_results['ids'][0]
-        candidate_ids = list(dict.fromkeys(candidate_ids))  # 保持顺序去重
-        if not candidate_ids:
-            return []
-
-        retrieved_data = await loop.run_in_executor(
-            None,
-            lambda: self.collection.get(
-                ids=candidate_ids, include=["documents", "metadatas"]
-            ),
-        )
-
-        final_results = []
-        for i, doc_id in enumerate(candidate_ids):
-            final_results.append({
-                "id": doc_id,
-                "text": retrieved_data['documents'][i],
-                "metadata": retrieved_data['metadatas'][i],
-                "rrf_score": 1.0 - (i / len(candidate_ids)),
-                "strategy": "vector",
-            })
-
-        if self.reranker and final_results:
-            try:
-                pairs = [[query, doc["text"]] for doc in final_results]
-                rerank_scores = await loop.run_in_executor(
-                    None, lambda: self.reranker.predict(pairs)
-                )
-                for i, doc in enumerate(final_results):
-                    doc["rerank_score"] = float(rerank_scores[i])
-                final_results.sort(
-                    key=lambda x: x["rerank_score"], reverse=True
-                )
-            except Exception as e:
-                logger.error("Vector re-ranking failed: %s", e)
-
-        return final_results[:settings.TOP_K_RERANK]
-
-    # ========================================================================
-    # BM25 关键词检索
-    # ========================================================================
-
-    async def _retrieve_bm25(
-        self, query: str, top_k: int
-    ) -> List[Dict[str, Any]]:
-        """纯 BM25 关键词检索。"""
-        current_bm25 = self.bm25_retriever
-        current_ids = self.bm25_corpus_ids
-
-        if current_bm25 is None or not current_ids:
-            return []
-
-        loop = asyncio.get_running_loop()
-        query_tokens = self._tokenize(query)
-        bm25_ids: List[str] = []
-        bm25_scores: List[float] = []
-
-        try:
-            n_results = min(top_k * 2, len(current_ids))
-            indices, scores = current_bm25.retrieve(
-                [query_tokens], k=n_results
-            )
-            if indices.size > 0 and scores.size > 0:
-                valid_indices = indices[0][scores[0] > 0]
-                valid_scores = scores[0][scores[0] > 0]
-                for i, idx in enumerate(valid_indices):
-                    if idx < len(current_ids):
-                        bm25_ids.append(current_ids[idx])
-                        bm25_scores.append(
-                            float(valid_scores[i])
-                            if i < len(valid_scores)
-                            else 0.0
-                        )
-        except Exception as e:
-            logger.error("BM25S single-strategy retrieval error: %s", e)
-            return []
-
-        if not bm25_ids:
-            return []
-
-        bm25_ids = list(dict.fromkeys(bm25_ids))  # 保持顺序去重
-
-        retrieved_data = await loop.run_in_executor(
-            None,
-            lambda: self.collection.get(
-                ids=bm25_ids[:top_k],
-                include=["documents", "metadatas"],
-            ),
-        )
-
-        final_results = []
-        for i, doc_id in enumerate(bm25_ids[:top_k]):
-            final_results.append({
-                "id": doc_id,
-                "text": retrieved_data['documents'][i],
-                "metadata": retrieved_data['metadatas'][i],
-                "rrf_score": (
-                    bm25_scores[i] if i < len(bm25_scores) else 0.0
-                ),
-                "strategy": "bm25",
-            })
-
-        return final_results
+        return await self._retrieve_hybrid(query, top_k)
 
     # ========================================================================
     # 混合检索（向量 + BM25 + RRF + Reranker）
@@ -278,6 +143,16 @@ class HybridRetriever(IndexingMixin):
         vec_ids = vector_results['ids'][0]
         vec_rank_map = {
             id_: rank + 1 for rank, id_ in enumerate(vec_ids)
+        }
+
+        # 直接从 query 结果构建 lookup，避免对向量命中 ID 的二次 ChromaDB 查询
+        vec_data: Dict[str, Dict[str, Any]] = {
+            id_: {"text": text, "metadata": meta}
+            for id_, text, meta in zip(
+                vector_results['ids'][0],
+                vector_results['documents'][0],
+                vector_results['metadatas'][0],
+            )
         }
 
         # Step 2: BM25S Retrieval
@@ -319,19 +194,33 @@ class HybridRetriever(IndexingMixin):
         if not candidate_ids:
             return []
 
-        retrieved_data = await loop.run_in_executor(
-            None,
-            lambda: self.collection.get(
-                ids=candidate_ids, include=["documents", "metadatas"]
-            ),
-        )
+        # 只对 BM25 独有（向量结果中不存在）的 ID 发起 ChromaDB 补充查询
+        bm25_only_ids = [cid for cid in candidate_ids if cid not in vec_data]
+        bm25_data: Dict[str, Dict[str, Any]] = {}
+        if bm25_only_ids:
+            bm25_retrieved = await loop.run_in_executor(
+                None,
+                lambda: self.collection.get(
+                    ids=bm25_only_ids, include=["documents", "metadatas"]
+                ),
+            )
+            for id_, text, meta in zip(
+                bm25_retrieved['ids'],
+                bm25_retrieved['documents'],
+                bm25_retrieved['metadatas'],
+            ):
+                bm25_data[id_] = {"text": text, "metadata": meta}
 
+        # 合并向量 lookup + BM25 补充数据构建候选文档
         candidate_docs = []
         for i, doc_id in enumerate(candidate_ids):
+            data = vec_data.get(doc_id) or bm25_data.get(doc_id)
+            if data is None:
+                continue
             candidate_docs.append({
                 "id": doc_id,
-                "text": retrieved_data['documents'][i],
-                "metadata": retrieved_data['metadatas'][i],
+                "text": data["text"],
+                "metadata": data["metadata"],
                 "rrf_score": sorted_rrf_items[i][1],
                 "strategy": "hybrid",
             })

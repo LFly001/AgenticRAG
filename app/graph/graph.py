@@ -1,45 +1,33 @@
-"""LangGraph 父图构建器 — 5-Agent 协作顶层编排。
+"""8-Agent 协作父图构建器。
 
-图拓扑（简化后）：
+图拓扑：
 
     START
       │
       ▼
-   conversation_agent
+   orchestrator（总调度，唯一入口）
       │
-      ├── (direct_answer) ──► save_conv → END
+      │  route_action="intent_agent"（固定第一步）
+      ▼
+   intent_agent（意图解析 + 澄清判断）
       │
-      └── (knowledge_query) → query_planner
-                                │
-           ┌────────────────────┴────────────────────┐
-           │                                         │
-      (simple)                                   (complex)
-           │                                         │
-           ▼                                         ▼
-      retriever_agent                        multi_retrieve
-           │                                  (parallel fan-out)
-           └────────────────┬──────────────────────┘
-                            ▼
-                      responder_agent ──► critic
-                                            │
-                                  ┌─────────┴─────────┐
-                              (pass)              (fail)
-                                  │                   │
-                                  ▼                   ▼
-                             save_conv → END      regenerate
-                                                    │
-                                                    └──► responder_agent
-
-5-Agent 矩阵：
-┌──────────────────┬──────────────────────────────────────┬──────────┐
-│ Agent            │ 职责                                  │ 类型     │
-├──────────────────┼──────────────────────────────────────┼──────────┤
-│ ConversationAgent│ 意图分类 + 对话记忆 + 追问融合 + 闲聊回复│ 子图     │
-│ QueryPlanner     │ 简单 vs 复合 + 拆解子问题              │ 子图     │
-│ RetrieverAgent   │ 策略选择 → 检索 → 自评 → 改写         │ 子图 ×N  │
-│ ResponderAgent   │ 上下文构建 → LLM 生成 → 引用解析       │ 子图     │
-│ CriticAgent      │ 事实核查 + 引用验证 + 完整性评估       │ 子图     │
-└──────────────────┴──────────────────────────────────────┴──────────┘
+      ▼
+   ┌─ route_dispatcher（全局分支分发）◄──────────────┐
+   │                                                  │
+   ├── "retriever_agent" → retriever_agent ────────────┤
+   ├── "doc_filter_agent" → doc_filter_agent ──────────┤
+   ├── "context_compress_agent" → context_compress ────┤
+   ├── "reason_agent" → reason_agent ─────────────────┤
+   ├── "writer_agent" → writer_agent ─────────────────┤
+   ├── "anti_hallucination_agent" → anti_hallucination ┤
+   └── "end" → END                                    │
+                                                      │
+   路由规则（route_dispatcher）：                      │
+   - need_clarify=True          → END                 │
+   - final_answer 已生成         → END                 │
+   - need_reretrieve=True       → retriever_agent     │
+   - hallucination=fail + 有余量 → reason_agent        │
+   - 其他                        → 按 route_action 跳转 │
 """
 
 from __future__ import annotations
@@ -47,115 +35,296 @@ from __future__ import annotations
 from langgraph.graph import StateGraph, END
 
 from app.graph.state import GraphState
-from app.graph.nodes import GraphNodes
 from app.graph.agents import (
-    build_conversation_agent,
-    build_planner_agent,
+    build_orchestrator_agent,
+    build_intent_agent,
     build_retriever_agent,
-    build_responder_agent,
-    build_critic_agent,
+    build_doc_filter_agent,
+    build_context_compress_agent,
+    build_reason_agent,
+    build_writer_agent,
+    build_anti_hallucination_agent,
+    route_dispatcher,
 )
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
-# ===========================
-# 条件边
-# ===========================
-
-def _route_after_conversation(state: GraphState) -> str:
-    """闲聊已生成答案 → save_conv；知识问答 → query_planner。"""
-    if state.get("final_answer"):
-        return "save_conversation"
-    return "query_planner"
-
-
-def _route_after_planner(state: GraphState) -> str:
-    if state.get("is_complex"):
-        return "multi_retrieve"
-    return "retriever_agent"
-
-
-def _route_after_critic(state: GraphState) -> str:
-    verdict = state.get("critic_verdict", "pass")
-    remaining = state.get("max_regenerates", 2) - state.get("regenerate_count", 0)
-    if verdict == "pass":
-        return "save_conversation"
-    if remaining > 0:
-        return "regenerate"
-    return "save_conversation"
-
-
-# ===========================
+# ============================================================================
 # 图构建入口
-# ===========================
+# ============================================================================
 
-def build_graph(retriever):
-    logger.info("Building ConversationAgent subgraph...")
-    conversation_graph = build_conversation_agent()
+def build_graph(retriever=None):
+    """构建 8-Agent 协作父图。
 
-    logger.info("Building QueryPlanner subgraph...")
-    planner_graph = build_planner_agent()
+    Args:
+        retriever: HybridRetriever 实例（传入 RetrieveAgent 子图，当前占位暂不使用）
 
-    logger.info("Building RetrieverAgent subgraph...")
-    retriever_agent_graph = build_retriever_agent(retriever)
+    Returns:
+        编译后的 CompiledGraph
+    """
+    # ── 构建 8 个子图 ──
+    logger.info("=" * 50)
+    logger.info("Building 8-Agent collaboration graph...")
+    logger.info("=" * 50)
 
-    logger.info("Building ResponderAgent subgraph...")
-    responder_agent_graph = build_responder_agent()
+    logger.info("[1/8] OrchestratorAgent")
+    orchestrator_graph = build_orchestrator_agent()
 
-    logger.info("Building CriticAgent subgraph...")
-    critic_agent_graph = build_critic_agent()
+    logger.info("[2/8] IntentAgent")
+    intent_graph = build_intent_agent()
 
-    nodes = GraphNodes(
-        conversation_graph,
-        planner_graph,
-        retriever_agent_graph,
-        responder_agent_graph,
-        critic_agent_graph,
-    )
+    logger.info("[3/8] RetrieveAgent")
+    retriever_graph = build_retriever_agent(retriever)
 
+    logger.info("[4/8] DocFilterAgent")
+    doc_filter_graph = build_doc_filter_agent()
+
+    logger.info("[5/8] ContextCompressAgent")
+    context_compress_graph = build_context_compress_agent()
+
+    logger.info("[6/8] ReasonAgent")
+    reason_graph = build_reason_agent()
+
+    logger.info("[7/8] WriterAgent")
+    writer_graph = build_writer_agent()
+
+    logger.info("[8/8] AntiHallucinationAgent")
+    anti_hallucination_graph = build_anti_hallucination_agent()
+
+    # ── 组装父图 ──
     workflow = StateGraph(GraphState)
 
-    workflow.add_node("conversation_agent", nodes.conversation_agent)
-    workflow.add_node("query_planner", nodes.query_planner)
-    workflow.add_node("retriever_agent", nodes.retriever_agent)
-    workflow.add_node("multi_retrieve", nodes.multi_retrieve)
-    workflow.add_node("responder_agent", nodes.responder_agent)
-    workflow.add_node("critic", nodes.critic)
-    workflow.add_node("regenerate", nodes.regenerate)
-    workflow.add_node("save_conversation", nodes.save_conversation)
+    # 添加 8 个节点
+    workflow.add_node("orchestrator", _make_node(orchestrator_graph, "orchestrator"))
+    workflow.add_node("intent_agent", _make_node(intent_graph, "intent_agent"))
+    workflow.add_node("retriever_agent", _make_node(retriever_graph, "retriever_agent"))
+    workflow.add_node("doc_filter_agent", _make_node(doc_filter_graph, "doc_filter_agent"))
+    workflow.add_node("context_compress_agent", _make_node(context_compress_graph, "context_compress_agent"))
+    workflow.add_node("reason_agent", _make_node(reason_graph, "reason_agent"))
+    workflow.add_node("writer_agent", _make_node(writer_graph, "writer_agent"))
+    workflow.add_node("anti_hallucination_agent", _make_node(anti_hallucination_graph, "anti_hallucination_agent"))
 
-    workflow.set_entry_point("conversation_agent")
+    # 入口：orchestrator
+    workflow.set_entry_point("orchestrator")
 
-    # 闲聊: conversation → save → END
-    # 知识: conversation → query_planner → ...
-    workflow.add_conditional_edges(
-        "conversation_agent", _route_after_conversation,
-        {"save_conversation": "save_conversation", "query_planner": "query_planner"},
-    )
-    workflow.add_edge("save_conversation", END)
+    # 固定第一步：orchestrator → intent_agent
+    workflow.add_edge("orchestrator", "intent_agent")
 
-    # 检索路径
-    workflow.add_conditional_edges(
-        "query_planner", _route_after_planner,
-        {"retriever_agent": "retriever_agent", "multi_retrieve": "multi_retrieve"},
-    )
-    workflow.add_edge("retriever_agent", "responder_agent")
-    workflow.add_edge("multi_retrieve", "responder_agent")
-    workflow.add_edge("responder_agent", "critic")
+    # 所有后续节点 → route_dispatcher（全局分支分发）
+    route_map = {
+        "retriever_agent": "retriever_agent",
+        "doc_filter_agent": "doc_filter_agent",
+        "context_compress_agent": "context_compress_agent",
+        "reason_agent": "reason_agent",
+        "writer_agent": "writer_agent",
+        "anti_hallucination_agent": "anti_hallucination_agent",
+        "end": END,
+    }
 
-    # 评审路径: pass → save → END, fail → regenerate → responder
-    workflow.add_conditional_edges(
-        "critic", _route_after_critic,
-        {"save_conversation": "save_conversation", "regenerate": "regenerate"},
-    )
-    workflow.add_edge("regenerate", "responder_agent")
+    workflow.add_conditional_edges("intent_agent", route_dispatcher, route_map)
+    workflow.add_conditional_edges("retriever_agent", route_dispatcher, route_map)
+    workflow.add_conditional_edges("doc_filter_agent", route_dispatcher, route_map)
+    workflow.add_conditional_edges("context_compress_agent", route_dispatcher, route_map)
+    workflow.add_conditional_edges("reason_agent", route_dispatcher, route_map)
+    workflow.add_conditional_edges("writer_agent", route_dispatcher, route_map)
+    workflow.add_conditional_edges("anti_hallucination_agent", route_dispatcher, route_map)
 
     compiled = workflow.compile()
 
+    logger.info("=" * 50)
     logger.info(
-        "5-Agent graph compiled (5 subgraphs, 8 nodes). "
-        "Entry: conversation_agent"
+        "8-Agent graph compiled (recursion_limit=50). "
+        "Topology: orchestrator → intent → [route_dispatcher ↔ 6 agents] → END"
     )
+    logger.info("Entry: orchestrator")
+    logger.info("=" * 50)
+
     return compiled
+
+
+# ============================================================================
+# 节点包装器 — 将子图 ainvoke 暴露为父图节点 callable
+# ============================================================================
+
+def _make_node(subgraph, node_name: str):
+    """将子图包装为父图可用的 async callable。
+
+    负责：
+    1. 适配父图 state → 子图 state 的字段映射
+    2. 调用子图 ainvoke
+    3. 将子图输出合并回父图 state（仅更新非空字段 + 合并 agent_log）
+    """
+
+    async def _node(state: GraphState):
+        logger.debug("[Graph] Entering node: %s", node_name)
+
+        # 构建子图输入（从父图 state 中选取相关字段）
+        sub_input = _build_subgraph_input(state, node_name)
+
+        # 诊断：关键数据节点记录输入大小
+        if node_name == "retriever_agent":
+            logger.info("[Graph.Pipe] retriever IN  raw_docs=%d", len(state.get("raw_docs", [])))
+        elif node_name == "doc_filter_agent":
+            logger.info("[Graph.Pipe] doc_filter IN  raw_docs=%d", len(state.get("raw_docs", [])))
+        elif node_name == "context_compress_agent":
+            logger.info("[Graph.Pipe] ctx_compress IN valid_docs=%d", len(state.get("valid_docs", [])))
+        elif node_name == "reason_agent":
+            logger.info("[Graph.Pipe] reason IN compressed_context=%d chars", len(state.get("compressed_context", "") or ""))
+
+        # 调用子图
+        sub_result = await subgraph.ainvoke(sub_input)
+
+        # 诊断：输出大小
+        if node_name == "retriever_agent":
+            logger.info("[Graph.Pipe] retriever OUT raw_docs=%d", len(sub_result.get("raw_docs", [])))
+        elif node_name == "doc_filter_agent":
+            logger.info("[Graph.Pipe] doc_filter OUT valid_docs=%d", len(sub_result.get("valid_docs", [])))
+        elif node_name == "context_compress_agent":
+            ctx = sub_result.get("compressed_context", "") or ""
+            logger.info("[Graph.Pipe] ctx_compress OUT compressed_context=%d chars", len(ctx))
+        elif node_name == "reason_agent":
+            logger.info("[Graph.Pipe] reason OUT reretrieve=%s", sub_result.get("need_reretrieve", False))
+
+        # 合并输出
+        merged = _merge_subgraph_output(state, sub_result, node_name)
+
+        logger.debug("[Graph] Exiting node: %s, route_action=%s",
+                      node_name, merged.get("route_action", "?"))
+        return merged
+
+    return _node
+
+
+def _build_subgraph_input(state: GraphState, node_name: str) -> dict:
+    """从父图 state 构建子图输入。
+
+    每个 Agent 子图只需要其关心的字段，避免字段名冲突。
+    """
+    # 通用字段（所有子图都可能需要）
+    base = {
+        "question": state.get("question", ""),
+        "agent_log": list(state.get("node_log", [])),
+    }
+
+    # 各节点特定字段
+    extras: dict = {}
+
+    if node_name == "orchestrator":
+        extras.update({
+            "session_id": state.get("session_id", ""),
+            "chat_history": state.get("chat_history", []),
+        })
+
+    elif node_name == "intent_agent":
+        extras.update({
+            "user_query": state.get("question", ""),
+            "chat_history": state.get("chat_history", []),
+        })
+
+    elif node_name == "retriever_agent":
+        extras.update({
+            "query_list": state.get("query_list", []),
+            "re_retrieve_queries": state.get("re_retrieve_queries", []),
+        })
+
+    elif node_name == "doc_filter_agent":
+        extras.update({
+            "documents": state.get("raw_docs", []),
+        })
+
+    elif node_name == "context_compress_agent":
+        extras.update({
+            "valid_docs": state.get("valid_docs", []),
+        })
+
+    elif node_name == "reason_agent":
+        extras.update({
+            "compressed_context": state.get("compressed_context", ""),
+            "conflict_note": state.get("conflict_note", ""),
+        })
+
+    elif node_name == "writer_agent":
+        extras.update({
+            "compressed_context": state.get("compressed_context", ""),
+            "reasoning_draft": state.get("reasoning_draft", ""),
+        })
+
+    elif node_name == "anti_hallucination_agent":
+        extras.update({
+            "raw_answer": state.get("raw_answer", ""),
+            "valid_docs": state.get("valid_docs", []),
+        })
+
+    return {**base, **extras}
+
+
+def _merge_subgraph_output(state: GraphState, sub_result: dict, node_name: str) -> dict:
+    """将子图输出合并到父图 state。
+
+    规则：
+    - 子图的 agent_log 合并到父图的 node_log
+    - 空列表 / 空字符串不覆盖已有数据
+    - None 值不覆盖
+    - intent_agent 特殊处理：need_clarify=True 时，clarify_msg → final_answer
+    """
+    merged: dict = {}
+
+    # agent_log → node_log 转换
+    sub_log = sub_result.get("agent_log", [])
+    if sub_log:
+        old_log = list(state.get("node_log", []))
+        merged["node_log"] = old_log + sub_log
+
+    # 所有非 agent_log 字段，按非空规则合并
+    for key, value in sub_result.items():
+        if key == "agent_log":
+            continue
+        if value is None:
+            continue
+        if isinstance(value, (list, str, dict)) and not value:
+            if key not in state or not state[key]:
+                merged[key] = value
+        else:
+            merged[key] = value
+
+    # intent_agent 特殊处理：闲聊 → 固定回复直接终止
+    if node_name == "intent_agent" and merged.get("is_chat"):
+        chat_reply = merged.get("chat_reply", "")
+        if chat_reply:
+            merged["final_answer"] = chat_reply
+            merged["route_action"] = "end"
+            logger.info(
+                "[Graph] intent_agent: is_chat=True → final_answer=chat_reply"
+            )
+
+    # intent_agent 特殊处理：需要澄清 → 将澄清话术作为最终答案
+    if node_name == "intent_agent" and merged.get("need_clarify"):
+        clarify_msg = merged.get("clarify_msg", "")
+        if clarify_msg:
+            merged["final_answer"] = clarify_msg
+            merged["route_action"] = "end"
+            logger.info(
+                "[Graph] intent_agent: need_clarify=True → final_answer=clarify_msg"
+            )
+
+    # retriever_agent 特殊处理：检索完成后重置 + 计数，避免死循环
+    if node_name == "retriever_agent":
+        if state.get("need_reretrieve"):
+            merged["re_retrieve_count"] = state.get("re_retrieve_count", 0) + 1
+        merged["need_reretrieve"] = False
+        merged["re_retrieve_queries"] = []
+
+    # anti_hallucination_agent 特殊处理（终端节点）：始终以修正后的 final_answer 作为最终输出
+    if node_name == "anti_hallucination_agent":
+        corrected = merged.get("final_answer", "") or state.get("raw_answer", "")
+        if corrected:
+            merged["final_answer"] = corrected
+        merged["route_action"] = "end"
+        logger.info(
+            "[Graph] anti_hallucination: terminal → route_action=end, risk=%s",
+            merged.get("hallucination_risk", "?"),
+        )
+
+    return merged

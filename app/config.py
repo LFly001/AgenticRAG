@@ -33,8 +33,6 @@ class Settings(BaseSettings):
     TOP_K_RETRIEVAL: int = Field(20)
     TOP_K_RERANK: int = Field(5)
     RRF_K_CONSTANT: int = Field(60)
-    BM25_WEIGHT: float = Field(0.5)
-    VECTOR_WEIGHT: float = Field(0.5)
 
     # --- Chunking ---
     CHUNK_SIZE: int = Field(512)

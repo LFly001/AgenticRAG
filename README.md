@@ -1,16 +1,37 @@
-# 🤖 多 Agent 协作智能知识库
+# 🤖 8-Agent 协作智能知识库
 
-基于 **LangGraph 5-Agent 协作架构** 的企业级 RAG 系统。
+基于 **LangGraph 8-Agent 协作架构** 的企业级 RAG 系统。
 
 ## 架构
 
+```
+orchestrator → intent → retriever → doc_filter → context_compress → reason → writer → anti_hallucination
+                  │                                                       │
+                  ├── 闲聊短路 / 澄清终止                                   └── 证据不足 → 二次检索回路
+                  │
+                  └── END
+```
+
 | Agent | 职责 |
 |---|---|
-| 💬 ConversationAgent | 对话记忆 + 追问识别 + 上下文融合 |
-| 📋 QueryPlanner | 复合问题自动拆解为子查询 |
-| 🔎 RetrieverAgent | 自主选择检索策略（向量/BM25/混合），自评质量并自动改写 |
-| ⚡ 并行检索 | 多子查询并行执行，结果合并去重 |
-| 🔍 CriticAgent | 三维度评审（事实/引用/完整性），拦截幻觉 |
+| 🎯 OrchestratorAgent | 总调度唯一入口，全局分支分发，trace_id 追踪 |
+| 💬 IntentAgent | 闲聊检测 + 指代消解 + 问题拆解 + 澄清判断 |
+| 🔍 RetrieveAgent | 并行混合检索（向量 + BM25 + RRF 融合 + CrossEncoder 重排序） |
+| 🫧 DocFilterAgent | 四重过滤（碎片/低分/过期/去重）+ 文档冲突检测 |
+| 🗜️ ContextCompressAgent | 结构化 XML 上下文 + token 预算控制 + LLM 智能压缩 |
+| 🧠 ReasonAgent | CoT 链式推理 + 证据充足度判断 + 触发二次检索 |
+| ✍️ WriterAgent | 基于推理框架生成答案 + 自动引用标注 + 敏感信息脱敏 |
+| 🛡️ AntiHallucinationAgent | 逐句核查 + 修正错误 + 幻觉风险评级 |
+
+### 链路
+
+| 链路 | 路径 | 触发条件 |
+|---|---|---|
+| 闲聊短路 | O → I → END | 问候/感谢/告别等非业务对话 |
+| 澄清终止 | O → I → END | 问题信息缺失/歧义，无法回答 |
+| 正常主链 | O → I → R → D → C → Re → W → A → END | 证据充足，一次通过 |
+| 二次检索 | O → I → R → D → C → Re → R → D → C → Re → W → A → END | 证据不足，补充检索 |
+| 高风险输出 | 同主链/二次检索，A 标记 `hallucination_risk="high"` | 检测到编造/虚假数据 |
 
 ## 快速开始
 
@@ -82,11 +103,11 @@ docker compose up -d
 ## 常用命令
 
 ```bash
-docker compose up -d          # 后台启动
-docker compose logs -f        # 查看日志
-docker compose logs -f backend # 仅后端日志
-docker compose down           # 停止并删除容器
-docker compose down -v        # 同时删除数据卷
+docker compose up -d              # 后台启动
+docker compose logs -f            # 查看日志
+docker compose logs -f backend    # 仅后端日志
+docker compose down               # 停止并删除容器
+docker compose down -v            # 同时删除数据卷
 ```
 
 ## 技术栈

@@ -1,376 +1,213 @@
-"""RetrieverAgent — 具备自主策略选择、自评估、自修正能力的检索专家子图。
+"""RetrieveAgent — 检索调度节点。
 
-内部工作流：
+职责：
+1. 遍历 query_list / re_retrieve_queries，并行执行 BM25 + 向量混合检索
+2. RRF 融合多路召回结果（由 HybridRetriever 内部完成）
+3. 跨子查询去重合并，按 rerank_score 降序排序
+4. 统一汇总输出 raw_docs
+
+内部工作流（2 节点）：
 
     START
       │
       ▼
-   strategy_selector ─→ 选择: vector | bm25 | hybrid
+   parallel_retrieve ─→ 遍历所有子查询，asyncio.gather 并行检索
       │
       ▼
-   retrieve ─→ 按选中策略执行检索
+   merge_and_format ─→ 跨子查询去重 + 排序 + 汇总 → raw_docs
       │
       ▼
-   self_evaluate ─→ 对每篇文档评 1-5 分
-      │
-      ├── 平均分 ≥ 3.0 或 无剩余尝试次数
-      │     │
-      │     └── format_output ──→ END（返回最佳文档）
-      │
-      └── 平均分 < 3.0 且 还有尝试次数
-            │
-            └── self_rewrite ──→ 改写查询，强制 hybrid 策略
-                  │
-                  └──→ retrieve（循环）
+     END
 
-与父图的关系：
-    父图将 RetrieverAgent 作为黑盒节点使用，
-    输入 query，输出经过自修正优化的文档列表。
+下游固定节点：doc_filter_agent
 """
 
 from __future__ import annotations
 
-import json
-from typing import Dict, Any
+import asyncio
+from typing import Dict, Any, List, Optional
 
-from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
 
-from app.config import settings
 from app.core.retriever import HybridRetriever
 from app.graph.agents.retriever.state import RetrieverState
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ============================================================================
-# LLM 工厂
-# ============================================================================
-
-
-def _create_strategy_llm() -> ChatOpenAI:
-    """策略选择 LLM — temperature=0，路由决策必须稳定可复现。"""
-    return ChatOpenAI(
-        model_name=settings.LLM_MODEL_NAME,
-        openai_api_key=settings.DEEPSEEK_API_KEY,
-        openai_api_base=settings.DEEPSEEK_BASE_URL,
-        temperature=0,
-        max_tokens=256,
-        request_timeout=15,
-        max_retries=1,
-    )
-
-
-def _create_evaluator_llm() -> ChatOpenAI:
-    """评估 LLM — temperature=0，确保评分一致性。"""
-    return ChatOpenAI(
-        model_name=settings.LLM_MODEL_NAME,
-        openai_api_key=settings.DEEPSEEK_API_KEY,
-        openai_api_base=settings.DEEPSEEK_BASE_URL,
-        temperature=0,
-        max_tokens=512,
-        request_timeout=20,
-        max_retries=1,
-    )
-
-
-def _create_rewriter_llm() -> ChatOpenAI:
-    """改写 LLM — temperature=0.3，需要一定的语言创造性。"""
-    return ChatOpenAI(
-        model_name=settings.LLM_MODEL_NAME,
-        openai_api_key=settings.DEEPSEEK_API_KEY,
-        openai_api_base=settings.DEEPSEEK_BASE_URL,
-        temperature=0.3,
-        max_tokens=512,
-        request_timeout=20,
-        max_retries=1,
-    )
-
 
 # ============================================================================
-# Prompt 模板
+# RetrieveAgent 类
 # ============================================================================
 
-STRATEGY_PROMPT = ChatPromptTemplate.from_template("""你是一个检索策略专家。分析用户查询的类型，选择最佳检索策略。
+class RetrieveAgent:
+    """RetrieveAgent — 检索调度专家。
 
-策略说明：
-- **vector**: 适合语义模糊、概念性问题。如："公司未来的发展方向是什么？"、"如何提高客户满意度？"
-- **bm25**: 适合事实精确匹配、关键词查询。如："2024年Q3财报收入"、"张三的工号是多少？"、"请假流程"
-- **hybrid**: 适合混合型问题，或不确定时使用。结合向量和关键词双重优势。
+    对每个子查询独立执行混合检索（向量 + BM25 + RRF + CrossEncoder 重排序），
+    并行化以降低延迟，最后跨子查询去重汇总。
 
-请**只返回一个 JSON 对象**，格式如下：
-{{"strategy": "<vector 或 bm25 或 hybrid>", "reason": "<一句话说明选择原因>"}}
-
-Query: {query}
-
-JSON:""")
-
-
-EVALUATE_PROMPT = ChatPromptTemplate.from_template("""你是一个检索质量评估专家。评估以下文档与用户查询的相关性。
-
-用户查询: {query}
-使用策略: {strategy}
-
-检索到的文档:
-{documents}
-
-为每篇文档打分（1-5分）：
-- 5: 高度相关，直接回答查询
-- 4: 相关，提供有用的上下文
-- 3: 部分相关
-- 2: 关联较弱
-- 1: 不相关
-
-请**只返回一个 JSON 对象**，格式如下：
-{{
-  "overall_score": <1-5的整数>,
-  "per_doc": [
-    {{
-      "doc_index": 0,
-      "score": 分数,
-      "reason": "一句评估"
-    }}
-  ],
-  "verdict": "<good 或 needs_improvement>",
-  "diagnosis": "<irrelevant_results / too_few / outdated / other>"
-}}
-
-JSON:""")
-
-
-REWRITE_PROMPT = ChatPromptTemplate.from_template("""你是一个查询改写专家。上一次检索质量不佳。
-
-诊断信息: {diagnosis}
-当前查询: {query}
-
-请改写查询以提高检索效果：
-1. 如果结果不相关，换用不同的关键词或从不同角度表述
-2. 如果结果太少，使用更宽泛的词汇
-3. 可以补充相关的同义词、术语、缩写/全称转换
-
-请**只返回改写后的查询文本**，不包含任何解释。
-
-改写后的查询:""")
-
-# ============================================================================
-# RetrieverAgent 类
-# ============================================================================
-
-
-class RetrieverAgent:
-    """RetrieverAgent — 自主检索专家。
-
-    封装了策略选择 → 检索 → 自评 → 改写的完整循环，
-    对外表现为一个可独立调用的子图。
+    依赖：
+        HybridRetriever — 封装了向量/Bm25/RRF/重排序全部逻辑
     """
 
     def __init__(self, retriever: HybridRetriever) -> None:
         self._retriever = retriever
-        self._strategy_llm = _create_strategy_llm()
-        self._evaluator_llm = _create_evaluator_llm()
-        self._rewriter_llm = _create_rewriter_llm()
 
-    # ---- 节点 1: 策略选择 ----
+    # ---- 节点 1: 并行检索 ----
 
-    async def strategy_selector(self, state: RetrieverState) -> Dict[str, Any]:
-        """分析查询特征，选择最佳检索策略。"""
-        query = state["query"]
-        logger.info(f"[RetrieverAgent.Strategy] Analyzing: {query[:80]}...")
+    async def parallel_retrieve(self, state: RetrieverState) -> Dict[str, Any]:
+        """遍历所有子查询，并行执行混合检索。
 
-        try:
-            chain = STRATEGY_PROMPT | self._strategy_llm
-            response = await chain.ainvoke({"query": query})
-            raw = response.content if hasattr(response, "content") else str(response)
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        优先级：
+        1. 若 re_retrieve_queries 非空 → 二次检索模式
+        2. 否则 → 正常检索，使用 query_list
+        """
+        agent_log: list[str] = list(state.get("agent_log", []))
 
-            result = json.loads(raw)
-            strategy = result.get("strategy", "hybrid")
-            reason = result.get("reason", "N/A")
-        except Exception as e:
-            logger.warning(f"[RetrieverAgent.Strategy] Parse failed ({e}), defaulting to hybrid.")
-            strategy = "hybrid"
-            reason = f"Parser error, default: {e}"
-
-        log_entry = f"🎯 策略选择: {strategy}（{reason}）"
-        logger.info(f"[RetrieverAgent.Strategy] {log_entry}")
-
-        return {
-            "strategy": strategy,
-            "original_query": query,
-            "attempt_count": 0,
-            "max_attempts": 3,
-            "agent_log": [log_entry],
-        }
-
-    # ---- 节点 2: 检索执行 ----
-
-    async def retrieve(self, state: RetrieverState) -> Dict[str, Any]:
-        """按当前策略执行检索。"""
-        query = state["query"]
-        strategy = state.get("strategy", "hybrid")
-        attempt_count = state.get("attempt_count", 0) + 1
-        agent_log = list(state.get("agent_log", []))
+        # 确定查询来源
+        re_queries: List[Dict[str, Any]] = state.get("re_retrieve_queries", [])
+        if re_queries:
+            queries = re_queries
+            mode = "re_retrieve"
+            agent_log.append(f"🔍 二次检索模式: {len(queries)} 个查询")
+        else:
+            queries = state.get("query_list", [])
+            mode = "normal"
+            if not queries:
+                agent_log.append("⚠️ query_list 为空，跳过检索")
+                return {
+                    "_retrieve_results": [],
+                    "agent_log": agent_log,
+                }
+            agent_log.append(f"🔍 检索模式: {len(queries)} 个子查询")
 
         logger.info(
-            "[RetrieverAgent.Retrieve] Attempt %d with '%s': %s...",
-            attempt_count, strategy, query[:80]
+            "[RetrieveAgent] %s mode, %d sub-queries", mode, len(queries)
         )
 
-        docs = await self._retriever.retrieve(query, strategy=strategy)
+        # 并行检索
+        async def _retrieve_one(sq: dict, idx: int) -> tuple:
+            """对单个子查询执行检索，捕获异常。"""
+            query_text = sq.get("query", "")
 
-        log_entry = f"🔍 检索 (第{attempt_count}次, {strategy}): 获取 {len(docs)} 篇文档"
-        agent_log.append(log_entry)
-        logger.info(f"[RetrieverAgent.Retrieve] {log_entry}")
+            try:
+                logger.debug(
+                    "[RetrieveAgent] Sub %d: %s",
+                    idx, query_text[:60],
+                )
+                docs = await self._retriever.retrieve(query=query_text)
+                # 标注来源子查询
+                for d in docs:
+                    d["sub_query_idx"] = idx
+                    d["sub_query_text"] = query_text
+                return (idx, docs, None)
+            except Exception as e:
+                logger.error(
+                    "[RetrieveAgent] Sub %d failed: %s", idx, e
+                )
+                return (idx, [], str(e))
+
+        tasks = [_retrieve_one(sq, i) for i, sq in enumerate(queries)]
+        results: List[tuple] = await asyncio.gather(*tasks)
+
+        # 汇总原始结果（不做去重，留给 merge 节点）
+        all_results: list = []
+        has_errors = False
+        for idx, docs, err in results:
+            if err:
+                agent_log.append(f"   ⚠️ Q{idx+1} 检索失败: {err}")
+                has_errors = True
+            else:
+                agent_log.append(
+                    f"   Q{idx+1}: {len(docs)} 篇 → \"{queries[idx].get('query', '')[:50]}\""
+                )
+            all_results.append(docs)
+
+        total_before_dedup = sum(len(d) for d in all_results)
+        agent_log.append(
+            f"🔍 检索完成: {len(queries)} 子查询 → 合计 {total_before_dedup} 篇（去重前）"
+        )
+
+        logger.info(
+            "[RetrieveAgent] %d sub-queries → %d docs (pre-dedup), errors=%s",
+            len(queries), total_before_dedup, has_errors,
+        )
 
         return {
-            "documents": docs,
-            "attempt_count": attempt_count,
+            "_retrieve_results": all_results,
             "agent_log": agent_log,
         }
 
-    # ---- 节点 3: 自我评估 ----
+    # ---- 节点 2: 去重 + 排序 + 汇总 ----
 
-    async def self_evaluate(self, state: RetrieverState) -> Dict[str, Any]:
-        """评估检索文档质量，判断是否需要改写重试。"""
-        query = state["original_query"] or state["query"]
-        strategy = state.get("strategy", "hybrid")
-        documents = state.get("documents", [])
-        agent_log = list(state.get("agent_log", []))
+    async def merge_and_format(self, state: RetrieverState) -> Dict[str, Any]:
+        """跨子查询去重合并，按 rerank_score 降序输出 raw_docs。
 
-        # 无文档直接判定失败
-        if not documents:
-            agent_log.append("📊 自评: 无文档返回，判定为 needs_improvement")
+        去重规则：同一 doc.id 在多个子查询命中时，保留最高 rerank_score 的那条。
+        排序规则：优先 rerank_score，其次 rrf_score。
+        """
+        all_results: list = state.get("_retrieve_results", [])
+        agent_log: list[str] = list(state.get("agent_log", []))
+
+        if not all_results:
+            agent_log.append("📭 无检索结果，raw_docs 为空")
             return {
+                "raw_docs": [],
+                "route_action": "doc_filter_agent",
                 "agent_log": agent_log,
-                "_verdict": "needs_improvement",
-                "_overall_score": 0,
-                "_diagnosis": "too_few",
             }
 
-        # 构建评估上下文
-        doc_summaries = []
-        for i, doc in enumerate(documents):
-            meta = doc.get("metadata", {})
-            r_score = doc.get("rerank_score")
-            r_str = f"{r_score:.4f}" if isinstance(r_score, (int, float)) else "N/A"
-            doc_summaries.append(
-                f"  [{i}] ID={doc['id']} | src={meta.get('source_file', '?')} | "
-                f"rerank={r_str} | "
-                f"text={doc.get('text', '')[:150]}..."
-            )
+        # 跨子查询去重：同一 doc_id 保留最高 rerank_score
+        seen: dict[str, dict] = {}
+        for doc_list in all_results:
+            for doc in doc_list:
+                doc_id = doc.get("id", "")
+                if not doc_id:
+                    continue
+                current_score = doc.get("rerank_score", doc.get("rrf_score", 0))
+                if doc_id not in seen:
+                    seen[doc_id] = doc
+                else:
+                    existing_score = seen[doc_id].get(
+                        "rerank_score", seen[doc_id].get("rrf_score", 0)
+                    )
+                    if current_score > existing_score:
+                        seen[doc_id] = doc
 
-        try:
-            chain = EVALUATE_PROMPT | self._evaluator_llm
-            response = await chain.ainvoke({
-                "query": query,
-                "strategy": strategy,
-                "documents": "\n".join(doc_summaries),
-            })
-            raw = response.content if hasattr(response, "content") else str(response)
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-
-            result = json.loads(raw)
-            overall_score = int(result.get("overall_score", 3))
-            verdict = result.get("verdict", "good")
-            diagnosis = result.get("diagnosis", "")
-
-            # 将单文档评分写入 metadata
-            per_doc = result.get("per_doc", [])
-            for entry in per_doc:
-                idx = entry.get("doc_index", -1)
-                if 0 <= idx < len(documents):
-                    documents[idx]["self_eval_score"] = entry.get("score", 3)
-                    documents[idx]["self_eval_reason"] = entry.get("reason", "")
-
-        except Exception as e:
-            logger.warning(f"[RetrieverAgent.Evaluate] Parse failed ({e}), defaulting to good.")
-            overall_score = 3
-            verdict = "good"
-            diagnosis = "Evaluation error, proceeding"
-
-        # 写入文档元数据
-        for doc in documents:
-            if "self_eval_score" not in doc:
-                doc["self_eval_score"] = overall_score
-            if "self_eval_reason" not in doc:
-                doc["self_eval_reason"] = ""
-
-        log_entry = f"📊 自评: 整体={overall_score}/5, 判定={verdict}, 诊断={diagnosis}"
-        agent_log.append(log_entry)
-        logger.info(f"[RetrieverAgent.Evaluate] {log_entry}")
-
-        return {
-            "documents": documents,
-            "agent_log": agent_log,
-            "_verdict": verdict,
-            "_overall_score": overall_score,
-            "_diagnosis": diagnosis,
-        }
-
-    # ---- 节点 4: 自我改写 ----
-
-    async def self_rewrite(self, state: RetrieverState) -> Dict[str, Any]:
-        """改写查询以改进检索效果。"""
-        query = state["original_query"] or state["query"]
-        diagnosis = state.get("_diagnosis", "unknown")
-        agent_log = list(state.get("agent_log", []))
-
-        logger.info(
-            "[RetrieverAgent.Rewrite] Rewriting for: %s... (diagnosis: %s)",
-            query[:80], diagnosis
-        )
-
-        try:
-            chain = REWRITE_PROMPT | self._rewriter_llm
-            response = await chain.ainvoke({
-                "diagnosis": diagnosis,
-                "query": query,
-            })
-            raw = response.content if hasattr(response, "content") else str(response)
-            new_query = raw.strip()
-        except Exception as e:
-            logger.warning(f"[RetrieverAgent.Rewrite] Failed ({e}), keeping original query.")
-            new_query = query
-
-        log_entry = f"✏️ 改写查询: {new_query[:120]}"
-        agent_log.append(log_entry)
-        logger.info(f"[RetrieverAgent.Rewrite] {log_entry}")
-
-        return {
-            "query": new_query,
-            "strategy": "hybrid",  # 改写后强制使用混合策略
-            "agent_log": agent_log,
-        }
-
-    # ---- 节点 5: 格式化输出 ----
-
-    async def format_output(self, state: RetrieverState) -> Dict[str, Any]:
-        """格式化最终输出 — 按 rerank_score 排序，附带 agent 日志。"""
-        documents = state.get("documents", [])
-        agent_log = list(state.get("agent_log", []))
-
-        # 按 rerank 分数降序排列
-        documents_sorted = sorted(
-            documents,
+        # 按 rerank_score 降序排列
+        raw_docs = sorted(
+            seen.values(),
             key=lambda d: d.get("rerank_score", d.get("rrf_score", 0)),
             reverse=True,
         )
 
-        agent_log.append(f"✅ 检索完成: 返回 {len(documents_sorted)} 篇文档")
+        total_before = sum(len(r) for r in all_results)
+        dupes_removed = total_before - len(raw_docs)
+
+        agent_log.append(
+            f"📊 汇总: {total_before} 篇 → 去重 {dupes_removed} → "
+            f"最终 {len(raw_docs)} 篇"
+        )
+
+        if raw_docs:
+            # 输出 Top-3 摘要
+            for i, doc in enumerate(raw_docs[:3]):
+                score = doc.get("rerank_score", doc.get("rrf_score", 0))
+                meta = doc.get("metadata", {})
+                src = meta.get("source_file", "?")
+                snippet = (doc.get("text", "")[:60]).replace("\n", " ")
+                agent_log.append(
+                    f"   #{i+1} [{score:.3f}] {src}: {snippet}..."
+                )
 
         logger.info(
-            f"[RetrieverAgent] Complete. "
-            f"Attempts={state.get('attempt_count', 0)}, "
-            f"Docs={len(documents_sorted)}"
+            "[RetrieveAgent] Merge: %d → %d docs (removed %d dupes)",
+            total_before, len(raw_docs), dupes_removed,
         )
 
         return {
-            "documents": documents_sorted,
+            "raw_docs": raw_docs,
+            "route_action": "doc_filter_agent",
             "agent_log": agent_log,
         }
 
@@ -379,87 +216,56 @@ class RetrieverAgent:
 # 子图构建函数
 # ============================================================================
 
-def build_retriever_agent(retriever: HybridRetriever):
-    """构建并编译 RetrieverAgent 子图。
+def build_retriever_agent(retriever: Optional[HybridRetriever] = None):
+    """构建并编译 RetrieveAgent 子图。
+
+    Args:
+        retriever: HybridRetriever 实例。若为 None，使用占位模式（返回空）。
 
     Returns:
-        编译后的 CompiledGraph，可通过 .ainvoke({"query": "..."}) 独立调用。
+        编译后的 CompiledGraph
+
+    拓扑：
+        START → parallel_retrieve → merge_and_format → END
     """
-    agent = RetrieverAgent(retriever)
+    agent = RetrieveAgent(retriever) if retriever else _PlaceholderRetriever()
 
     workflow = StateGraph(RetrieverState)
 
-    # -- 注册节点 --
-    workflow.add_node("strategy_selector", agent.strategy_selector)
-    workflow.add_node("retrieve", agent.retrieve)
-    workflow.add_node("self_evaluate", agent.self_evaluate)
-    workflow.add_node("self_rewrite", agent.self_rewrite)
-    workflow.add_node("format_output", agent.format_output)
+    workflow.add_node("parallel_retrieve", agent.parallel_retrieve)
+    workflow.add_node("merge_and_format", agent.merge_and_format)
 
-    # -- 设置入口 --
-    workflow.set_entry_point("strategy_selector")
-
-    # -- 添加边 --
-    workflow.add_edge("strategy_selector", "retrieve")
-    workflow.add_edge("retrieve", "self_evaluate")
-
-    # self_evaluate → 条件分支
-    workflow.add_conditional_edges(
-        "self_evaluate",
-        _route_after_evaluate,
-        {
-            "format_output": "format_output",
-            "self_rewrite": "self_rewrite",
-        },
-    )
-
-    # self_rewrite → retrieve（内部修正循环）
-    workflow.add_edge("self_rewrite", "retrieve")
-
-    # format_output → END
-    workflow.add_edge("format_output", END)
+    workflow.set_entry_point("parallel_retrieve")
+    workflow.add_edge("parallel_retrieve", "merge_and_format")
+    workflow.add_edge("merge_and_format", END)
 
     compiled = workflow.compile()
 
     logger.info(
-        "RetrieverAgent subgraph compiled. "
-        "Topology: START → strategy_selector → retrieve → self_evaluate "
-        "→ [format_output|self_rewrite → retrieve (loop)]"
+        "RetrieveAgent subgraph compiled. "
+        "Topology: START → parallel_retrieve → merge_and_format → END"
     )
 
     return compiled
 
 
 # ============================================================================
-# 内部条件边
+# 占位回退（retriever 不可用时）
 # ============================================================================
 
-def _route_after_evaluate(state: RetrieverState) -> str:
-    """自我评估后的路由决策。
+class _PlaceholderRetriever:
+    """无检索器时的安全回退。"""
 
-    规则：
-    1. verdict == "good" → format_output
-    2. 还有剩余尝试次数 → self_rewrite
-    3. 否则 → format_output（即使质量差也不再重试）
-    """
-    verdict = state.get("_verdict", "good")
-    attempt_count = state.get("attempt_count", 0)
-    max_attempts = state.get("max_attempts", 3)
-    remaining = max_attempts - attempt_count
+    async def parallel_retrieve(self, state: RetrieverState) -> Dict[str, Any]:
+        agent_log = list(state.get("agent_log", []))
+        agent_log.append("⚠️ [RetrieveAgent] 无 HybridRetriever 实例，返回空")
+        return {"_retrieve_results": [], "agent_log": agent_log}
 
-    logger.info(
-        f"[RetrieverAgent.Edge] verdict={verdict}, "
-        f"attempts={attempt_count}/{max_attempts}"
-    )
-
-    if verdict == "good":
-        logger.info("[RetrieverAgent.Edge] → format_output (good quality)")
-        return "format_output"
-
-    if remaining > 0:
-        logger.info(f"[RetrieverAgent.Edge] → self_rewrite ({remaining} attempts left)")
-        return "self_rewrite"
-
-    # 耗尽所有尝试
-    logger.warning("[RetrieverAgent.Edge] → format_output (no attempts left, best effort)")
-    return "format_output"
+    async def merge_and_format(self, state: RetrieverState) -> Dict[str, Any]:
+        agent_log = list(state.get("agent_log", []))
+        agent_log.append("📭 占位模式: raw_docs 为空")
+        return {
+            "raw_docs": [],
+            "route_action": "doc_filter_agent",
+            "agent_log": agent_log,
+        }

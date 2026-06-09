@@ -1,5 +1,6 @@
-"""RetrieverAgent — 自主检索专家。"""
-from app.graph.agents.retriever.agent import build_retriever_agent, RetrieverAgent
+"""RetrieveAgent — 检索调度节点。"""
+
+from app.graph.agents.retriever.agent import RetrieveAgent, build_retriever_agent
 from app.graph.agents.retriever.state import RetrieverState
 
-__all__ = ["build_retriever_agent", "RetrieverAgent", "RetrieverState"]
+__all__ = ["RetrieveAgent", "build_retriever_agent", "RetrieverState"]

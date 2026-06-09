@@ -3,7 +3,7 @@
 # ============================================================
 #
 # 服务架构：
-#   - backend:  FastAPI 后端（5-Agent 协作图）
+#   - backend:  FastAPI 后端（8-Agent 协作图）
 #   - frontend: Streamlit Web 前端
 #   - redis:    Redis — 父文档缓存 + 多轮对话记忆
 #
@@ -81,8 +81,6 @@ services:
       - TOP_K_RETRIEVAL=${TOP_K_RETRIEVAL:-20}
       - TOP_K_RERANK=${TOP_K_RERANK:-5}
       - RRF_K_CONSTANT=${RRF_K_CONSTANT:-60}
-      - BM25_WEIGHT=${BM25_WEIGHT:-0.5}
-      - VECTOR_WEIGHT=${VECTOR_WEIGHT:-0.5}
 
       # === 切片参数 ===
       - CHUNK_SIZE=${CHUNK_SIZE:-512}

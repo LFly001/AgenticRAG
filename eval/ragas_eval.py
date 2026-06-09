@@ -1,8 +1,8 @@
 # flake8: noqa: E402  — sys.path 操作必须在本地导入之前
-"""RAGAS 评估脚本 — 通过完整 5-Agent 图执行评估。
+"""RAGAS 评估脚本 — 通过完整 8-Agent 图执行评估。
 
-覆盖全链路：ConversationAgent → QueryPlanner → RetrieverAgent
-           → ResponderAgent → CriticAgent → [regenerate]
+覆盖全链路：Orchestrator → Intent → Retriever → DocFilter
+           → ContextCompress → Reason → Writer → AntiHallucination
 """
 
 import asyncio
@@ -52,20 +52,20 @@ except ImportError:
 
 
 class RagasEvaluator:
-    """通过完整多 Agent 图的 RAGAS 评估器。"""
+    """通过完整 8-Agent 图的 RAGAS 评估器。"""
 
     CACHE_FILE = os.path.join(os.path.dirname(__file__), "rag_generation_cache.json")
 
     def __init__(self):
-        logger.info("Initializing RAGAS Evaluator (Multi-Agent mode)...")
+        logger.info("Initializing RAGAS Evaluator (8-Agent mode)...")
 
         # 1. 初始化底层组件
         self.retriever = HybridRetriever()
 
-        # 2. 构建完整 5-Agent 图
-        logger.info("Building 5-Agent graph for evaluation...")
+        # 2. 构建完整 8-Agent 图
+        logger.info("Building 8-Agent graph for evaluation...")
         self.graph = build_graph(self.retriever)
-        logger.info("5-Agent graph ready.")
+        logger.info("8-Agent graph ready.")
 
         # 3. RAGAS 评估 LLM
         self.eval_llm = LangchainLLMWrapper(
@@ -87,31 +87,38 @@ class RagasEvaluator:
         self.eval_embeddings = LangchainEmbeddingsWrapper(embed_model)
 
     async def run_pipeline_async(self, question: str) -> Dict[str, Any]:
-        """通过完整多 Agent 图运行一次问答。
+        """通过完整 8-Agent 图运行一次问答。
 
-        流程：router → conversation_agent → query_planner
-              → retriever_agent/multi_retrieve → responder_agent
-              → critic → [regenerate → responder_agent]
+        流程：orchestrator → intent → retriever → doc_filter
+              → context_compress → reason → writer → anti_hallucination
         """
         try:
             # 执行完整 LangGraph 工作流
-            result = await self.graph.ainvoke({
-                "question": question,
-                "session_id": "",  # 评估模式不使用对话记忆
-            })
+            result = await self.graph.ainvoke(
+                {
+                    "question": question,
+                    "session_id": "",  # 评估模式不使用对话记忆
+                },
+                config={"recursion_limit": 50},
+            )
 
             answer = result.get("final_answer", "")
-            documents = result.get("documents", [])
+            documents = result.get("raw_docs", [])
             node_log = result.get("node_log", [])
-            critic_verdict = result.get("critic_verdict", "")
+            hallucination_risk = result.get("hallucination_risk", "")
+            trace_id = result.get("trace_id", "")
 
             # 提取文本作为 RAGAS contexts
             contexts = [doc.get("text", "") for doc in documents if doc.get("text")]
 
             logger.info(
-                f"Graph complete: answer={len(answer)} chars, "
-                f"contexts={len(contexts)}, verdict={critic_verdict}, "
-                f"path={' → '.join(node_log[-4:])}"
+                "Graph complete: trace=%s answer=%d chars, "
+                "contexts=%d, verdict=%s, path=%s",
+                trace_id[:8] if trace_id else "none",
+                len(answer),
+                len(contexts),
+                hallucination_risk,
+                " → ".join(node_log[-4:]),
             )
 
             return {
@@ -119,13 +126,15 @@ class RagasEvaluator:
                 "answer": answer or "未生成答案",
                 "contexts": contexts,
                 "success": bool(answer),
-                "critic_verdict": critic_verdict,
+                "hallucination_risk": hallucination_risk,
                 "node_log": node_log,
             }
 
         except Exception as e:
             logger.error(
-                f"Graph pipeline error for '{question[:50]}...': {e}",
+                "Graph pipeline error for '%s...': %s",
+                question[:50],
+                e,
                 exc_info=True,
             )
             return {
@@ -133,14 +142,14 @@ class RagasEvaluator:
                 "answer": f"Graph Error: {str(e)}",
                 "contexts": [],
                 "success": False,
-                "critic_verdict": "error",
+                "hallucination_risk": "error",
                 "node_log": [],
             }
 
     def load_or_prepare_dataset(
         self,
         test_cases: List[Dict[str, str]],
-        max_concurrency: int = 3,  # 降低并发，图执行更重
+        max_concurrency: int = 3,
     ) -> Dataset:
         """准备 RAGAS 数据集，支持缓存。"""
         cache_path = Path(self.CACHE_FILE)
@@ -173,7 +182,7 @@ class RagasEvaluator:
         # 2. 无缓存 → 通过图生成
         logger.info(
             f"Generating answers for {len(test_cases)} cases "
-            f"(concurrency={max_concurrency}) via multi-agent graph..."
+            f"(concurrency={max_concurrency}) via 8-agent graph..."
         )
 
         semaphore = asyncio.Semaphore(max_concurrency)
@@ -187,8 +196,7 @@ class RagasEvaluator:
                         "answer": result["answer"],
                         "ground_truth": case["ground_truth"],
                         "contexts": result["contexts"],
-                        # 附加信息不参与 RAGAS 计算，但保留用于调试
-                        "_critic_verdict": result.get("critic_verdict", ""),
+                        "_hallucination_risk": result.get("hallucination_risk", ""),
                         "_node_log": result.get("node_log", []),
                     }
                 else:
@@ -209,7 +217,6 @@ class RagasEvaluator:
         try:
             valid_results = loop.run_until_complete(run_all())
         except RuntimeError:
-            # 当前已在事件循环中
             import nest_asyncio
             nest_asyncio.apply()
             valid_results = asyncio.run(run_all())
@@ -253,11 +260,11 @@ class RagasEvaluator:
         logger.info("Starting RAGAS evaluation (this may take a while)...")
 
         metrics = [
-            faithfulness,
-            answer_relevancy,
-            context_precision,
-            context_recall,
-            answer_correctness,
+            faithfulness,       # 忠实度：回答是否完全依托检索上下文，无编造幻觉
+            answer_relevancy,   # 回答相关性：回答和用户提问是否匹配
+            context_precision,  # 上下文精确率：检索到的片段里有效有用信息占比
+            context_recall,     # 上下文召回率：问题所需关键信息是否全被检索出来
+            answer_correctness, # 回答正确率：回答事实、逻辑是否准确无误
         ]
 
         result = evaluate(
@@ -269,7 +276,7 @@ class RagasEvaluator:
         )
 
         print("\n" + "=" * 50)
-        print("  RAGAS Evaluation Results (Multi-Agent Graph)")
+        print("  RAGAS Evaluation Results (8-Agent Graph)")
         print("=" * 50)
         df_results = result.to_pandas()
         print(df_results.describe())
@@ -310,5 +317,5 @@ if __name__ == "__main__":
         sys.exit(1)
 
     evaluator = RagasEvaluator()
-    logger.info("Starting RAGAS evaluation via multi-agent graph...")
+    logger.info("Starting RAGAS evaluation via 8-agent graph...")
     evaluator.evaluate_system(TEST_CASES)

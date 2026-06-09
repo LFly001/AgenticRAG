@@ -1,34 +1,108 @@
-"""多 Agent 协作模块 — 5-Agent 协作架构。
+"""8-Agent 协作模块。
 
 Agent 清单：
-┌────────────────────┬──────────────────────────────────┐
-│ Agent              │ 职责                              │
-├────────────────────┼──────────────────────────────────┤
-│ ConversationAgent  │ 对话记忆 + 追问识别 + 上下文融合    │
-│ QueryPlanner       │ 复杂度判断 + 复合问题拆解为子查询   │
-│ RetrieverAgent     │ 策略选择 → 检索 → 自评 → 改写      │
-│ ResponderAgent     │ 上下文构建 → LLM 生成 → 引用解析    │
-│ CriticAgent        │ 事实核查 → 引用验证 → 完整性评估    │
-└────────────────────┴──────────────────────────────────┘
+┌──────────────────────┬──────────────────────────────────┐
+│ Agent                │ 职责                              │
+├──────────────────────┼──────────────────────────────────┤
+│ OrchestratorAgent    │ 总调度，唯一入口，全局分支分发      │
+│ IntentAgent          │ 意图解析，澄清判断                 │
+│ RetrieveAgent        │ 检索调度，多策略召回               │
+│ DocFilterAgent       │ 文档校验清洗，去重过滤             │
+│ ContextCompressAgent │ 上下文压缩，token 预算管理         │
+│ ReasonAgent          │ 逻辑推理，思维链生成               │
+│ WriterAgent          │ 答案生成，引用规范                 │
+│ AntiHallucinationAgent│ 幻觉检测，事实校验                │
+└──────────────────────┴──────────────────────────────────┘
+
+图拓扑：
+
+    START
+      │
+      ▼
+   orchestrator ──→ route_dispatcher（全局分支分发）
+      │                  ▲
+      ▼                  │
+   intent_agent ─────────┤
+      │                  │
+      ▼                  │
+   retriever_agent ──────┤
+      │                  │
+      ▼                  │
+   doc_filter_agent ─────┤
+      │                  │
+      ▼                  │
+   context_compress ─────┤
+      │                  │
+      ▼                  │
+   reason_agent ─────────┤
+      │                  │
+      ▼                  │
+   writer_agent ─────────┤
+      │                  │
+      ▼                  │
+   anti_hallucination ───┘
+      │
+      ▼
+     END
 """
 
-from app.graph.agents.conversation.agent import (
-    build_conversation_agent, ConversationAgent,
+from app.graph.agents.orchestrator import (
+    OrchestratorAgent,
+    build_orchestrator_agent,
+    route_dispatcher,
+    OrchestratorState,
 )
-from app.graph.agents.conversation.state import ConversationState
-from app.graph.agents.retriever.agent import build_retriever_agent, RetrieverAgent
-from app.graph.agents.retriever.state import RetrieverState
-from app.graph.agents.critic.agent import build_critic_agent, CriticAgent
-from app.graph.agents.critic.state import CriticState
-from app.graph.agents.planner.agent import build_planner_agent, QueryPlanner
-from app.graph.agents.planner.state import PlannerState
-from app.graph.agents.responder.agent import build_responder_agent, ResponderAgent
-from app.graph.agents.responder.state import ResponderState
+from app.graph.agents.intent import (
+    IntentAgent,
+    build_intent_agent,
+    IntentState,
+)
+from app.graph.agents.retriever import (
+    RetrieveAgent,
+    build_retriever_agent,
+    RetrieverState,
+)
+from app.graph.agents.doc_filter import (
+    DocFilterAgent,
+    build_doc_filter_agent,
+    DocFilterState,
+)
+from app.graph.agents.context_compress import (
+    ContextCompressAgent,
+    build_context_compress_agent,
+    ContextCompressState,
+)
+from app.graph.agents.reason import (
+    ReasonAgent,
+    build_reason_agent,
+    ReasonState,
+)
+from app.graph.agents.writer import (
+    WriterAgent,
+    build_writer_agent,
+    WriterState,
+)
+from app.graph.agents.anti_hallucination import (
+    AntiHallucinationAgent,
+    build_anti_hallucination_agent,
+    AntiHallucinationState,
+)
 
 __all__ = [
-    "build_conversation_agent", "ConversationAgent", "ConversationState",
-    "build_retriever_agent", "RetrieverAgent", "RetrieverState",
-    "build_critic_agent", "CriticAgent", "CriticState",
-    "build_planner_agent", "QueryPlanner", "PlannerState",
-    "build_responder_agent", "ResponderAgent", "ResponderState",
+    # Orchestrator
+    "OrchestratorAgent", "build_orchestrator_agent", "route_dispatcher", "OrchestratorState",
+    # Intent
+    "IntentAgent", "build_intent_agent", "IntentState",
+    # Retriever
+    "RetrieveAgent", "build_retriever_agent", "RetrieverState",
+    # DocFilter
+    "DocFilterAgent", "build_doc_filter_agent", "DocFilterState",
+    # ContextCompress
+    "ContextCompressAgent", "build_context_compress_agent", "ContextCompressState",
+    # Reason
+    "ReasonAgent", "build_reason_agent", "ReasonState",
+    # Writer
+    "WriterAgent", "build_writer_agent", "WriterState",
+    # AntiHallucination
+    "AntiHallucinationAgent", "build_anti_hallucination_agent", "AntiHallucinationState",
 ]

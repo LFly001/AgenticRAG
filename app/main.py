@@ -1,13 +1,15 @@
-"""多 Agent 协作智能知识库 — FastAPI 应用主入口。
+"""8-Agent 协作智能知识库 — FastAPI 应用主入口。
+
+Agent 协作流程：
+  OrchestratorAgent（总调度）→ IntentAgent（意图解析）
+      → RetrieveAgent（检索召回）→ DocFilterAgent（文档清洗）
+      → ContextCompressAgent（上下文压缩）→ ReasonAgent（逻辑推理）
+      → WriterAgent（答案生成）→ AntiHallucinationAgent（幻觉检测）→ END
 
 路由：
   POST /upload          文档上传 + 后台解析入库
   GET  /task-status/{id} 后台任务状态查询
-  POST /query           统一问答入口（5-Agent 协作图）
-
-Agent 协作流程：
-  ConversationAgent（意图分类+对话记忆）→ QueryPlanner → RetrieverAgent(×N)
-        → ResponderAgent → CriticAgent → [regenerate]
+  POST /query           统一问答入口（8-Agent 协作图）
 """
 
 import asyncio
@@ -39,7 +41,7 @@ _task_status_lock = asyncio.Lock()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期：初始化基础组件 + 构建多 Agent 协作图。"""
+    """应用生命周期：初始化基础组件 + 构建 8-Agent 协作图。"""
     logger.info("Initializing application resources...")
 
     # 1. 文档处理管道
@@ -49,12 +51,12 @@ async def lifespan(app: FastAPI):
     # 2. 混合检索器（向量 + BM25 + RRF 融合 + CrossEncoder 重排序）
     app.state.retriever = HybridRetriever()
 
-    # 3. 构建 5-Agent 协作图（5 子图 + 8 父图节点）
-    logger.info("Building 5-Agent collaboration graph...")
+    # 3. 构建 8-Agent 协作图
+    logger.info("Building 8-Agent collaboration graph...")
     app.state.graph = build_graph(app.state.retriever)
     logger.info(
-        "5-Agent graph ready (ConversationAgent + QueryPlanner + "
-        "RetrieverAgent + ResponderAgent + CriticAgent)."
+        "8-Agent graph ready (Orchestrator + Intent + Retriever + DocFilter + "
+        "ContextCompress + Reason + Writer + AntiHallucination)."
     )
 
     logger.info("All resources initialized successfully.")
@@ -62,7 +64,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down application...")
 
 
-app = FastAPI(title="Multi-Agent Intelligent Knowledge Base", lifespan=lifespan)
+app = FastAPI(title="8-Agent Intelligent Knowledge Base", lifespan=lifespan)
 
 
 async def _set_task_status(task_id: str, status: str) -> None:
@@ -164,31 +166,37 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
 
 @app.post("/query", response_model=QueryResponse)
 async def query_knowledge(query_request: QueryRequest, req: Request):
-    """统一问答入口 — 5-Agent 协作图（含对话记忆）。
+    """统一问答入口 — 8-Agent 协作图（含对话记忆）。
 
     完整执行路径：
-    1. ConversationAgent 意图分类 + 对话记忆 + 追问融合（含闲聊直接回复）
-    2. QueryPlanner 复杂度分析 + 复合问题拆解
-    3. RetrieverAgent 策略选择 → 检索 → 自评 → 改写
-    4. ResponderAgent 上下文构建 → LLM 生成 → 引用解析
-    5. CriticAgent 三维度评审 → pass / fail → regenerate
-    6. save_conversation 保存问答到 Redis 记忆
+    1. OrchestratorAgent 初始化 trace_id，路由至 IntentAgent
+    2. IntentAgent 意图解析 + 澄清判断
+    3. RetrieveAgent 混合检索召回
+    4. DocFilterAgent 文档校验清洗
+    5. ContextCompressAgent 上下文压缩
+    6. ReasonAgent 逻辑推理
+    7. WriterAgent 答案生成 + 引用规范
+    8. AntiHallucinationAgent 幻觉检测 + 修正 → 输出最终答案
     """
     try:
         graph = req.app.state.graph
 
-        logger.info(f"[MultiAgent] Processing: {query_request.question[:80]}...")
+        logger.info("[8-Agent] Processing: %s...", query_request.question[:80])
 
         # 执行 LangGraph 工作流
-        result = await graph.ainvoke({
-            "question": query_request.question,
-            "session_id": query_request.session_id,
-        })
+        result = await graph.ainvoke(
+            {
+                "question": query_request.question,
+                "session_id": query_request.session_id,
+            },
+            config={"recursion_limit": 50},
+        )
 
         final_answer = result.get("final_answer", "")
         sources = result.get("sources", [])
         retrieval_details = result.get("retrieval_details", {})
         node_log = result.get("node_log", [])
+        trace_id = result.get("trace_id", "")
 
         # 构建 SourceInfo 列表
         source_objects = [
@@ -208,7 +216,9 @@ async def query_knowledge(query_request: QueryRequest, req: Request):
         )
 
         logger.info(
-            f"[MultiAgent] Complete. Path: {' → '.join(node_log)}"
+            "[8-Agent] Complete. trace=%s path=%s",
+            trace_id[:8] if trace_id else "none",
+            " → ".join(node_log[-6:]),
         )
 
         return QueryResponse(
@@ -220,7 +230,7 @@ async def query_knowledge(query_request: QueryRequest, req: Request):
         )
 
     except Exception as e:
-        logger.error(f"Query error: {e}", exc_info=True)
+        logger.error("Query error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
