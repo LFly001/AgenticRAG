@@ -10,7 +10,7 @@
 set -e
 
 echo "=============================================="
-echo "  Multi-Agent Knowledge Base — Entrypoint"
+echo "  AgenticRAG Knowledge Base — Entrypoint"
 echo "=============================================="
 
 # --- 颜色输出 ---

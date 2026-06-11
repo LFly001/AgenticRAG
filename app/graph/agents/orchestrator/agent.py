@@ -112,12 +112,12 @@ class OrchestratorAgent:
         """
         question = state.get("question", "")
         session_id = state.get("session_id", "")
-        node_log: list = list(state.get("node_log", []))
+        agent_log: list = list(state.get("agent_log", []))
 
         trace_id = str(uuid.uuid4())
         original_question = question  # 固化原始输入
 
-        node_log.append(f"🚀 Orchestrator 启动 | trace_id={trace_id[:8]}")
+        agent_log.append(f"🚀 Orchestrator 启动 | trace_id={trace_id[:8]}")
 
         logger.info(
             "[Orchestrator.Init] trace=%s session=%s question=%s",
@@ -130,19 +130,7 @@ class OrchestratorAgent:
             "trace_id": trace_id,
             "original_question": original_question,
             "route_action": "intent_agent",
-            "is_chat": False,
-            "chat_reply": "",
-            "need_clarify": False,
-            "clarify_msg": "",
-            "query_list": [],
-            "raw_docs": [],
-            "re_retrieve_queries": [],
-            "re_retrieve_count": 0,
-            "need_reretrieve": False,
-            "valid_docs": [],
-            "conflict_note": "",
-            "sources": [],
-            "node_log": node_log,
+            "agent_log": agent_log,
         }
 
 
@@ -166,10 +154,4 @@ def build_orchestrator_agent():
     workflow.add_edge("init", END)
 
     compiled = workflow.compile()
-
-    logger.info(
-        "OrchestratorAgent subgraph compiled. "
-        "Topology: START → init → END"
-    )
-
     return compiled

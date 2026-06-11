@@ -7,9 +7,11 @@ Agent 协作流程：
       → WriterAgent（答案生成）→ AntiHallucinationAgent（幻觉检测）→ END
 
 路由：
-  POST /upload          文档上传 + 后台解析入库
-  GET  /task-status/{id} 后台任务状态查询
-  POST /query           统一问答入口（8-Agent 协作图）
+  POST   /upload             文档上传 + 后台解析入库
+  GET    /task-status/{id}   后台任务状态查询
+  GET    /documents          列出知识库所有文档
+  DELETE /documents/{filename} 按文件名删除文档
+  POST   /query              统一问答入口（8-Agent 协作图）
 """
 
 import asyncio
@@ -25,8 +27,17 @@ from fastapi import (
 from app.core.chunker import SmartChunker
 from app.core.parser import DocumentParser
 from app.core.retriever import HybridRetriever
+from app.stores.session_store import conv_store
 from app.graph import build_graph
-from app.models import QueryRequest, QueryResponse, RetrievalDetails, SourceInfo
+from app.models import (
+    DeleteResponse,
+    DocumentInfo,
+    DocumentListResponse,
+    QueryRequest,
+    QueryResponse,
+    RetrievalDetails,
+    SourceInfo,
+)
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -37,6 +48,10 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # 后台任务状态字典，受 _task_status_lock 保护
 task_status: dict[str, str] = {}
 _task_status_lock = asyncio.Lock()
+
+# 正在处理的文件集合，防止同名文件并发重复入库
+_processing_files: set[str] = set()
+_processing_files_lock = asyncio.Lock()
 
 
 @asynccontextmanager
@@ -122,6 +137,9 @@ async def process_document_background(file_path: str, filename: str, task_id: st
         logger.error(f"[Task {task_id}] Processing failed: {e}", exc_info=True)
         await _set_task_status(task_id, f"failed: {str(e)}")
     finally:
+        # 释放文件级处理锁
+        async with _processing_files_lock:
+            _processing_files.discard(filename)
         if os.path.exists(file_path):
             try:
                 await loop.run_in_executor(None, os.remove, file_path)
@@ -134,6 +152,15 @@ async def process_document_background(file_path: str, filename: str, task_id: st
 async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     if ".." in file.filename or file.filename.startswith("/"):
         raise HTTPException(status_code=400, detail="Invalid filename")
+
+    # 同名文件正在处理中 → 拒绝重复提交
+    async with _processing_files_lock:
+        if file.filename in _processing_files:
+            raise HTTPException(
+                status_code=409,
+                detail=f"文件 '{file.filename}' 正在处理中，请等待完成后再上传",
+            )
+        _processing_files.add(file.filename)
 
     file_path = os.path.join(UPLOAD_DIR, file.filename)
     task_id = str(uuid.uuid4())
@@ -164,6 +191,69 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
+@app.get("/documents", response_model=DocumentListResponse)
+async def list_documents(req: Request):
+    """列出知识库中所有文档（按文件名汇总切片数量）。"""
+    try:
+        retriever = req.app.state.retriever
+        docs = await retriever.list_all_documents()
+
+        total_chunks = sum(d["chunk_count"] for d in docs)
+        document_infos = [
+            DocumentInfo(filename=d["filename"], chunk_count=d["chunk_count"])
+            for d in docs
+        ]
+
+        logger.info(
+            "Listed %d documents (%d total chunks).",
+            len(document_infos), total_chunks,
+        )
+        return DocumentListResponse(
+            documents=document_infos,
+            total_chunks=total_chunks,
+        )
+
+    except Exception as e:
+        logger.error("List documents error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.delete("/documents/{filename:path}", response_model=DeleteResponse)
+async def delete_document(filename: str, req: Request):
+    """按文件名删除知识库中的文档及其所有切片。"""
+    try:
+        # 安全检查：文件名不能为空
+        if not filename.strip():
+            raise HTTPException(status_code=400, detail="Filename cannot be empty")
+
+        retriever = req.app.state.retriever
+        deleted_count = await retriever.delete_documents_by_source(filename)
+
+        if deleted_count == 0:
+            return DeleteResponse(
+                success=True,
+                message=f"文档 '{filename}' 不存在或无切片可删除",
+                deleted_chunks=0,
+            )
+
+        logger.info(
+            "Deleted document '%s' with %d chunks.", filename, deleted_count,
+        )
+        return DeleteResponse(
+            success=True,
+            message=f"已删除文档 '{filename}' 的 {deleted_count} 个切片",
+            deleted_chunks=deleted_count,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Delete document error for '%s': %s", filename, e, exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
 @app.post("/query", response_model=QueryResponse)
 async def query_knowledge(query_request: QueryRequest, req: Request):
     """统一问答入口 — 8-Agent 协作图（含对话记忆）。
@@ -180,6 +270,7 @@ async def query_knowledge(query_request: QueryRequest, req: Request):
     """
     try:
         graph = req.app.state.graph
+        session_id = query_request.session_id
 
         logger.info("[8-Agent] Processing: %s...", query_request.question[:80])
 
@@ -187,7 +278,7 @@ async def query_knowledge(query_request: QueryRequest, req: Request):
         result = await graph.ainvoke(
             {
                 "question": query_request.question,
-                "session_id": query_request.session_id,
+                "session_id": session_id,
             },
             config={"recursion_limit": 50},
         )
@@ -197,6 +288,11 @@ async def query_knowledge(query_request: QueryRequest, req: Request):
         retrieval_details = result.get("retrieval_details", {})
         node_log = result.get("node_log", [])
         trace_id = result.get("trace_id", "")
+
+        # 持久化本轮对话（多轮记忆）
+        if session_id and final_answer:
+            conv_store.append(session_id, "user", query_request.question)
+            conv_store.append(session_id, "assistant", final_answer)
 
         # 构建 SourceInfo 列表
         source_objects = [

@@ -35,14 +35,23 @@ class Settings(BaseSettings):
     RRF_K_CONSTANT: int = Field(60)
 
     # --- Chunking ---
-    CHUNK_SIZE: int = Field(512)
-    CHUNK_OVERLAP: int = Field(50)
+    CHUNK_SIZE: int = Field(256)
+    CHUNK_OVERLAP: int = Field(32)
 
     # --- Redis ---
     REDIS_HOST: str = Field("localhost")
     REDIS_PORT: int = Field(6379)
     REDIS_DB: int = Field(0)
     REDIS_PASSWORD: Optional[str] = Field(None)
+    REDIS_MAX_MEMORY: str = Field("512mb", description="Redis 最大内存上限")
+    REDIS_MAX_MEMORY_POLICY: str = Field("allkeys-lru", description="内存满时淘汰策略")
+    PARENT_CONTEXT_TTL: int = Field(2592000, description="父文档 Redis 过期时间（秒），默认 30 天")
+    PARENT_CONTEXT_MAX_CHARS: int = Field(8000, description="单个父文档最大字符数，超出截断")
+
+    # --- Conversation ---
+    MAX_HISTORY_TURNS: int = Field(10, description="会话保留最大轮数（每轮=user+assistant）")
+    MAX_MESSAGE_CHARS: int = Field(2000, description="单条消息存入 Redis 的最大字符数，超出截断")
+    CONV_TTL: int = Field(86400, description="会话 Redis key 过期时间（秒），默认 24 小时")
 
     model_config = SettingsConfigDict(
         env_file=".env",

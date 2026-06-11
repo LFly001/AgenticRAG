@@ -25,11 +25,10 @@ from __future__ import annotations
 
 from typing import Dict, Any, List
 
-from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
 
-from app.config import settings
+from app.core.llm_factory import get_llm
 from app.graph.agents.context_compress.state import ContextCompressState
 from app.utils.logger import get_logger
 
@@ -42,23 +41,6 @@ logger = get_logger(__name__)
 MAX_CONTEXT_TOKENS = 3500        # 压缩后上下文最大 token 数
 TOKENS_PER_CHAR_CN = 0.67        # 中文字符 → token 估算系数（约 1.5 char/token）
 TOKENS_PER_CHAR_EN = 0.25        # 英文字符 → token 估算系数（约 4 char/token）
-
-
-# ============================================================================
-# LLM
-# ============================================================================
-
-def _create_compress_llm() -> ChatOpenAI:
-    """压缩 LLM — temperature=0，输出必须稳定可复现。"""
-    return ChatOpenAI(
-        model_name=settings.LLM_MODEL_NAME,
-        openai_api_key=settings.DEEPSEEK_API_KEY,
-        openai_api_base=settings.DEEPSEEK_BASE_URL,
-        temperature=0,
-        max_tokens=2048,
-        request_timeout=40,
-        max_retries=2,
-    )
 
 
 # ============================================================================
@@ -131,14 +113,13 @@ class ContextCompressAgent:
     """
 
     def __init__(self) -> None:
-        self._compress_llm = _create_compress_llm()
+        self._compress_llm = get_llm(temperature=0, max_tokens=2048, timeout=40)
 
     # ---- 节点 1: 格式化上下文 + token 预估 ----
 
     async def format_context(self, state: ContextCompressState) -> Dict[str, Any]:
         """将 valid_docs 格式化为结构化 XML，预估 token 数。"""
         valid_docs: List[Dict[str, Any]] = state.get("valid_docs", [])
-        question = state.get("question", "")
         agent_log: list[str] = list(state.get("agent_log", []))
 
         logger.info("[ContextCompress.Format] IN: %d docs", len(valid_docs))
@@ -200,7 +181,6 @@ class ContextCompressAgent:
         raw_context: str = state.get("_raw_context", "")
         token_est: int = state.get("_token_estimate", 0)
         question = state.get("question", "")
-        valid_docs = state.get("valid_docs", [])
         agent_log: list[str] = list(state.get("agent_log", []))
 
         # 空上下文
@@ -216,8 +196,10 @@ class ContextCompressAgent:
             agent_log.append(
                 f"🗜️ 无需压缩: ~{token_est}/{MAX_CONTEXT_TOKENS} tokens，直接透传"
             )
-            logger.info("[ContextCompress] Within budget (%d/%d), passthrough.",
-                         token_est, MAX_CONTEXT_TOKENS)
+            logger.info(
+                "[ContextCompress] Within budget (%d/%d), passthrough.",
+                token_est, MAX_CONTEXT_TOKENS,
+            )
             return {
                 "compressed_context": raw_context,
                 "route_action": "reason_agent",
@@ -228,8 +210,10 @@ class ContextCompressAgent:
         agent_log.append(
             f"🗜️ 触发压缩: ~{token_est}/{MAX_CONTEXT_TOKENS} tokens → LLM 压缩中..."
         )
-        logger.info("[ContextCompress] Over budget (%d/%d), compressing...",
-                     token_est, MAX_CONTEXT_TOKENS)
+        logger.info(
+            "[ContextCompress] Over budget (%d/%d), compressing...",
+            token_est, MAX_CONTEXT_TOKENS,
+        )
 
         try:
             chain = COMPRESS_PROMPT | self._compress_llm
@@ -297,10 +281,4 @@ def build_context_compress_agent():
     workflow.add_edge("compress", END)
 
     compiled = workflow.compile()
-
-    logger.info(
-        "ContextCompressAgent subgraph compiled. "
-        "Topology: START → format_context → compress → END"
-    )
-
     return compiled

@@ -153,6 +153,7 @@ class RetrieveAgent:
             agent_log.append("📭 无检索结果，raw_docs 为空")
             return {
                 "raw_docs": [],
+                "retrieval_details": {"doc_count": 0, "rerank_scores": []},
                 "route_action": "doc_filter_agent",
                 "agent_log": agent_log,
             }
@@ -207,6 +208,13 @@ class RetrieveAgent:
 
         return {
             "raw_docs": raw_docs,
+            "retrieval_details": {
+                "doc_count": len(raw_docs),
+                "rerank_scores": [
+                    d.get("rerank_score", d.get("rrf_score", 0))
+                    for d in raw_docs
+                ],
+            },
             "route_action": "doc_filter_agent",
             "agent_log": agent_log,
         }
@@ -240,12 +248,6 @@ def build_retriever_agent(retriever: Optional[HybridRetriever] = None):
     workflow.add_edge("merge_and_format", END)
 
     compiled = workflow.compile()
-
-    logger.info(
-        "RetrieveAgent subgraph compiled. "
-        "Topology: START → parallel_retrieve → merge_and_format → END"
-    )
-
     return compiled
 
 
@@ -266,6 +268,7 @@ class _PlaceholderRetriever:
         agent_log.append("📭 占位模式: raw_docs 为空")
         return {
             "raw_docs": [],
+            "retrieval_details": {"doc_count": 0, "rerank_scores": []},
             "route_action": "doc_filter_agent",
             "agent_log": agent_log,
         }

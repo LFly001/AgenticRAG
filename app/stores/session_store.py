@@ -1,29 +1,27 @@
-"""会话记忆存储 — 基于 Redis 的多轮对话上下文管理。
+"""会话记忆存储 — 基于 Redis LIST 的多轮对话上下文管理。
 
 Key 格式:  conv:{session_id}
-Value:     JSON 数组 [{role, content, timestamp}, ...]
+Value:     Redis LIST，每条元素为 JSON 字符串 [{role, content, timestamp}, ...]
 TTL:       24 小时（可配置）
+
+设计要点：
+- 使用 RPUSH + LTRIM 原子操作，消除 read-modify-write 竞态
+- 共享 Redis 连接（app.stores.redis_client），避免多连接池浪费
 """
 
 import json
 import time
-from typing import List, Dict, Optional
-
-import redis
+from typing import List, Dict
 
 from app.config import settings
+from app.stores.redis_client import get_redis_client
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# 默认对话保留轮数
-MAX_HISTORY_TURNS = 10
-# Redis key 过期时间（秒），默认 24 小时
-DEFAULT_TTL = 86400
-
 
 class ConversationStore:
-    """Redis 对话记忆存储。
+    """Redis 对话记忆存储 — 基于 LIST，原子操作无竞态。
 
     用法：
         store = ConversationStore()
@@ -33,28 +31,7 @@ class ConversationStore:
     """
 
     def __init__(self):
-        self._client: Optional[redis.Redis] = None
-        try:
-            self._client = redis.Redis(
-                host=settings.REDIS_HOST,
-                port=settings.REDIS_PORT,
-                db=settings.REDIS_DB,
-                password=settings.REDIS_PASSWORD,
-                decode_responses=True,
-                socket_connect_timeout=5,
-                socket_timeout=5,
-            )
-            self._client.ping()
-            logger.info(
-                "ConversationStore connected to Redis at %s:%d",
-                settings.REDIS_HOST, settings.REDIS_PORT,
-            )
-        except Exception as e:
-            logger.warning(
-                "ConversationStore: Redis unavailable (%s). "
-                "Multi-turn memory disabled.", e,
-            )
-            self._client = None
+        self._client = get_redis_client()
 
     @property
     def available(self) -> bool:
@@ -66,43 +43,44 @@ class ConversationStore:
     # ---- public API ----
 
     def append(self, session_id: str, role: str, content: str) -> None:
-        """添加一条对话记录。"""
+        """原子追加一条对话记录 — 截断 + RPUSH + LTRIM + EXPIRE，无竞态。"""
         if not self._client or not session_id:
             return
         try:
+            max_chars = settings.MAX_MESSAGE_CHARS
+            trimmed = content if len(content) <= max_chars else content[:max_chars] + "..."
+
             entry = {
                 "role": role,
-                "content": content,
+                "content": trimmed,
                 "timestamp": time.time(),
             }
             key = self._key(session_id)
+            max_entries = settings.MAX_HISTORY_TURNS * 2
             pipe = self._client.pipeline()
-            raw = self._client.get(key)
-            history: list = json.loads(raw) if raw else []
-            history.append(entry)
-            # 只保留最近 N 轮（每轮 = user + assistant）
-            if len(history) > MAX_HISTORY_TURNS * 2:
-                history = history[-(MAX_HISTORY_TURNS * 2):]
-            pipe.set(key, json.dumps(history, ensure_ascii=False))
-            pipe.expire(key, DEFAULT_TTL)
+            pipe.rpush(key, json.dumps(entry, ensure_ascii=False))
+            pipe.ltrim(key, -max_entries, -1)
+            pipe.expire(key, settings.CONV_TTL)
             pipe.execute()
         except Exception as e:
             logger.warning("ConversationStore append failed: %s", e)
 
     def get_history(self, session_id: str) -> List[Dict[str, str]]:
-        """获取对话历史（不含 timestamp）。"""
+        """获取对话历史（不含 timestamp，LRANGE 全量读取）。"""
         if not self._client or not session_id:
             return []
         try:
-            raw = self._client.get(self._key(session_id))
-            if not raw:
+            raw_entries = self._client.lrange(self._key(session_id), 0, -1)
+            if not raw_entries:
                 return []
-            history = json.loads(raw)
-            # 只返回 role + content，去掉 timestamp
-            return [
-                {"role": h["role"], "content": h["content"]}
-                for h in history
-            ]
+            history = []
+            for raw in raw_entries:
+                try:
+                    h = json.loads(raw)
+                    history.append({"role": h["role"], "content": h["content"]})
+                except (json.JSONDecodeError, KeyError):
+                    continue
+            return history
         except Exception as e:
             logger.warning("ConversationStore get_history failed: %s", e)
             return []

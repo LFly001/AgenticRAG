@@ -26,32 +26,14 @@ from __future__ import annotations
 import re
 from typing import Dict, Any, List
 
-from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
 
-from app.config import settings
+from app.core.llm_factory import get_llm
 from app.graph.agents.writer.state import WriterState
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-
-# ============================================================================
-# LLM
-# ============================================================================
-
-def _create_writer_llm() -> ChatOpenAI:
-    """生成 LLM — temperature=0.2，保持准确性同时有一定流畅度。"""
-    return ChatOpenAI(
-        model_name=settings.LLM_MODEL_NAME,
-        openai_api_key=settings.DEEPSEEK_API_KEY,
-        openai_api_base=settings.DEEPSEEK_BASE_URL,
-        temperature=0.2,
-        max_tokens=2048,
-        request_timeout=45,
-        max_retries=2,
-    )
 
 
 # ============================================================================
@@ -135,7 +117,7 @@ class WriterAgent:
     """
 
     def __init__(self) -> None:
-        self._writer_llm = _create_writer_llm()
+        self._writer_llm = get_llm(temperature=0.2, max_tokens=2048, timeout=45)
 
     # ---- 节点 1: 生成答案 ----
 
@@ -150,10 +132,14 @@ class WriterAgent:
         if not compressed_context:
             raw_answer = "抱歉，根据现有知识库，暂未找到与您问题相关的信息。请尝试换个方式提问，或联系管理员补充相关文档。"
             agent_log.append("✍️ 生成: 上下文为空，返回默认响应")
+            prev_details = state.get("retrieval_details", {})
             return {
                 "raw_answer": raw_answer,
                 "sources": [],
-                "retrieval_details": {"doc_count": 0},
+                "retrieval_details": {
+                    "doc_count": 0,
+                    "rerank_scores": prev_details.get("rerank_scores", []),
+                },
                 "agent_log": agent_log,
             }
 
@@ -259,8 +245,10 @@ class WriterAgent:
                 f"{len(sources)} 个有效来源"
             )
 
-        # 统计 doc_count
+        # 统计 doc_count，并保留 retriever 传入的 rerank_scores
+        prev_details = state.get("retrieval_details", {})
         doc_count = len(set(s.get("id") for s in sources))
+        rerank_scores = prev_details.get("rerank_scores", [])
 
         logger.info(
             "[WriterAgent.Parse] %d citations → %d unique sources",
@@ -269,7 +257,10 @@ class WriterAgent:
 
         return {
             "sources": sources,
-            "retrieval_details": {"doc_count": doc_count},
+            "retrieval_details": {
+                "doc_count": doc_count,
+                "rerank_scores": rerank_scores,
+            },
             "route_action": "anti_hallucination_agent",
             "agent_log": agent_log,
         }
@@ -297,10 +288,4 @@ def build_writer_agent():
     workflow.add_edge("parse_sources", END)
 
     compiled = workflow.compile()
-
-    logger.info(
-        "WriterAgent subgraph compiled. "
-        "Topology: START → generate → parse_sources → END"
-    )
-
     return compiled

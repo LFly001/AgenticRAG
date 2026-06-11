@@ -100,6 +100,9 @@ class DocumentParser:
     def _convert_elements_to_dicts(elements: List[Any], source_file: str) -> List[Dict[str, Any]]:
         processed_data = []
 
+        # 只保留文件名，避免完整路径在 URL 传参时被规范化导致匹配失败
+        clean_source = os.path.basename(source_file)
+
         for elem in elements:
             if not hasattr(elem, 'text') or not elem.text:
                 continue
@@ -125,7 +128,7 @@ class DocumentParser:
             item = {
                 "text": final_text,
                 "metadata": {
-                    "source": source_file,
+                    "source": clean_source,
                     "page_number": page_number,
                     "element_type": category,
                     "is_table": is_table,

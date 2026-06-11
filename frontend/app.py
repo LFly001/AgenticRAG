@@ -3,6 +3,7 @@ import requests
 import time
 import os
 import uuid
+from urllib.parse import quote
 
 API_BASE_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 MAX_POLL_RETRIES = 120
@@ -23,6 +24,8 @@ if "pending_task_id" not in st.session_state:
     st.session_state.pending_task_id = None
 if "poll_count" not in st.session_state:
     st.session_state.poll_count = 0
+if "uploading" not in st.session_state:
+    st.session_state.uploading = False  # 上传锁，防止轮询 rerun 触发重复提交
 
 # ============================================================================
 # 侧边栏
@@ -38,14 +41,20 @@ with st.sidebar:
         label_visibility="visible",
     )
 
-    # 上传按钮
+    # 上传按钮（有任务在跑时禁用，防重复提交）
+    upload_disabled = (
+        uploaded_file is None
+        or st.session_state.pending_task_id is not None
+        or st.session_state.uploading
+    )
     upload_clicked = st.button(
         "🚀 开始解析并入库",
-        disabled=(uploaded_file is None),
+        disabled=upload_disabled,
     )
 
-    # ——— 执行上传 ———
-    if upload_clicked and uploaded_file is not None:
+    # ——— 执行上传（uploading 锁防 rerun 重复触发）———
+    if upload_clicked and uploaded_file is not None and not st.session_state.uploading:
+        st.session_state.uploading = True
         with st.spinner("正在上传文件..."):
             files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
             try:
@@ -59,11 +68,14 @@ with st.sidebar:
                         del st.session_state["file_uploader"]
                     st.success("📤 文件已上传，后台处理中...")
                     time.sleep(0.5)
+                    st.session_state.uploading = False
                     st.rerun()
                 else:
                     st.error(f"上传失败: {resp.text}")
+                    st.session_state.uploading = False
             except Exception as e:
                 st.error(f"连接服务器失败: {e}")
+                st.session_state.uploading = False
 
     # ——— 轮询（仅在活跃任务时） ———
     task_id = st.session_state.pending_task_id
@@ -129,11 +141,90 @@ with st.sidebar:
             time.sleep(POLL_INTERVAL)
             st.rerun()
 
+    # ========================================================================
+    # 📋 知识库文档管理
+    # ========================================================================
+    st.divider()
+    st.header("📋 知识库管理")
+
+    # 初始化状态
+    if "doc_list" not in st.session_state:
+        st.session_state.doc_list = None
+    if "delete_target" not in st.session_state:
+        st.session_state.delete_target = None
+
+    # ---- 刷新 ----
+    if st.button("🔄 刷新文档列表", use_container_width=True):
+        try:
+            resp = requests.get(f"{API_BASE_URL}/documents", timeout=10)
+            if resp.status_code == 200:
+                st.session_state.doc_list = resp.json()
+            else:
+                st.error(f"获取文档列表失败: {resp.text}")
+        except requests.exceptions.ConnectionError:
+            st.warning("⚠️ 无法连接后端")
+        except Exception as e:
+            st.error(f"错误: {e}")
+
+    # ---- 显示文档列表 ----
+    doc_list = st.session_state.doc_list
+    if doc_list and doc_list.get("documents"):
+        docs = doc_list["documents"]
+        st.caption(f"{len(docs)} 份文档 · {doc_list['total_chunks']} 个切片")
+
+        for i, doc in enumerate(docs):
+            filename = doc["filename"]
+            count = doc["chunk_count"]
+
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.text(f"📄 {filename}\n   {count} 切片")
+            with col2:
+                # 按钮只设 flag，不执行任何 IO
+                if st.button("🗑️", key=f"delbtn_{i}", help=f"删除 {filename}"):
+                    st.session_state.delete_target = filename
+                    st.rerun()
+    elif doc_list is not None and not doc_list.get("documents"):
+        st.info("知识库为空，暂无文档。")
+
+    # ---- 执行删除（在循环外部，避免 widget 状态冲突） ----
+    target = st.session_state.delete_target
+    if target:
+        try:
+            encoded_name = quote(target, safe="")
+            del_resp = requests.delete(
+                f"{API_BASE_URL}/documents/{encoded_name}",
+                timeout=30,
+            )
+            if del_resp.status_code == 200:
+                del_data = del_resp.json()
+                if del_data["success"]:
+                    st.success(del_data["message"])
+                else:
+                    st.error(del_data["message"])
+            else:
+                st.error(f"删除失败 ({del_resp.status_code}): {del_resp.text}")
+        except Exception as e:
+            st.error(f"连接错误: {e}")
+        finally:
+            # 清除目标并自动刷新列表
+            st.session_state.delete_target = None
+            try:
+                refresh_resp = requests.get(f"{API_BASE_URL}/documents", timeout=10)
+                if refresh_resp.status_code == 200:
+                    st.session_state.doc_list = refresh_resp.json()
+            except Exception:
+                st.session_state.doc_list = None
+            time.sleep(0.3)
+            st.rerun()
+
     st.divider()
     st.caption(f"🆔 会话: `{st.session_state.session_id[:8]}...`")
     if st.button("🗑️ 新对话"):
         st.session_state.session_id = str(uuid.uuid4())
         st.session_state.messages = []
+        # 也清除文档列表缓存
+        st.session_state.doc_list = None
         st.rerun()
 
 # ============================================================================

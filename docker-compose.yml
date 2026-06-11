@@ -91,6 +91,10 @@ services:
       - REDIS_PORT=6379
       - REDIS_DB=${REDIS_DB:-0}
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - REDIS_MAX_MEMORY=${REDIS_MAX_MEMORY:-512mb}
+      - REDIS_MAX_MEMORY_POLICY=${REDIS_MAX_MEMORY_POLICY:-allkeys-lru}
+      - PARENT_CONTEXT_TTL=${PARENT_CONTEXT_TTL:-2592000}
+      - PARENT_CONTEXT_MAX_CHARS=${PARENT_CONTEXT_MAX_CHARS:-8000}
 
       # === NLTK ===
       - NLTK_DATA=/app/nltk_data
@@ -117,9 +121,9 @@ services:
     command: >
       sh -c "
       if [ -n \"${REDIS_PASSWORD:-}\" ]; then
-        redis-server --appendonly yes --requirepass \"${REDIS_PASSWORD}\";
+        redis-server --appendonly yes --maxmemory ${REDIS_MAX_MEMORY:-512mb} --maxmemory-policy ${REDIS_MAX_MEMORY_POLICY:-allkeys-lru} --requirepass \"${REDIS_PASSWORD}\";
       else
-        redis-server --appendonly yes;
+        redis-server --appendonly yes --maxmemory ${REDIS_MAX_MEMORY:-512mb} --maxmemory-policy ${REDIS_MAX_MEMORY_POLICY:-allkeys-lru};
       fi
       "
     healthcheck:

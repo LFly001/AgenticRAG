@@ -39,7 +39,6 @@ class GraphState(TypedDict, total=False):
     - raw_docs: 并行检索 + RRF 融合后的原始文档列表
     - re_retrieve_queries: 二次检索的查询列表（下游触发时填充）
     - need_reretrieve: 是否需要二次检索
-    - reretrieve_reason: 二次检索触发原因
 
     ── 文档过滤层 ──
     - valid_docs: 校验清洗后的可信文档集合
@@ -69,7 +68,6 @@ class GraphState(TypedDict, total=False):
     question: str
     original_question: str
     session_id: str
-    chat_history: List[Dict[str, str]]
     trace_id: str
 
     # 意图层
@@ -84,7 +82,6 @@ class GraphState(TypedDict, total=False):
     re_retrieve_queries: List[Dict[str, Any]]
     re_retrieve_count: int
     need_reretrieve: bool
-    reretrieve_reason: str
 
     # 文档过滤层
     valid_docs: List[Dict[str, Any]]

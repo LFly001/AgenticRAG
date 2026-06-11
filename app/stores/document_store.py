@@ -1,7 +1,7 @@
 """父文档上下文存储 — 基于 Redis 的 Parent-Child 父块缓存，带降级处理。"""
-import redis
 from typing import Optional, Dict
-from app.config import settings
+
+from app.stores.redis_client import get_redis_client
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -14,34 +14,14 @@ class RedisParentStore:
     Value: 完整的文本内容
     """
     def __init__(self):
-        # 从 settings 获取 Redis 配置，如果没有则使用默认本地配置
-        self.redis_host = getattr(settings, 'REDIS_HOST', 'localhost')
-        self.redis_port = getattr(settings, 'REDIS_PORT', 6379)
-        self.redis_db = getattr(settings, 'REDIS_DB', 0)
-        self.redis_password = getattr(settings, 'REDIS_PASSWORD', None)
-
-        self.client = None
-        try:
-            self.client = redis.Redis(
-                host=self.redis_host,
-                port=self.redis_port,
-                db=self.redis_db,
-                password=self.redis_password,
-                decode_responses=True,  # 自动解码 bytes 为 str
-                socket_connect_timeout=5,
-                socket_timeout=5
-            )
-            # 测试连接
-            self.client.ping()
-            logger.info(f"Connected to Redis at {self.redis_host}:{self.redis_port}")
-        except Exception as e:
-            # 降低日志级别为 WARNING，因为系统设计了降级方案
+        self.client = get_redis_client()
+        if self.client:
+            logger.info("RedisParentStore ready (shared connection).")
+        else:
             logger.warning(
-                "Redis connection failed: %s. "
-                "Parent context storage disabled. Using fallback mode.",
-                e,
+                "RedisParentStore: Redis unavailable. "
+                "Parent context enrichment disabled."
             )
-            self.client = None
 
     def save_parent_context(self, parent_id: str, text: str, expire_seconds: int = None):
         """
@@ -71,6 +51,30 @@ class RedisParentStore:
         except Exception as e:
             logger.error(f"Failed to get parent context from Redis for {parent_id}: {e}")
             return None
+
+    def batch_get(self, parent_ids: list[str]) -> Dict[str, Optional[str]]:
+        """批量获取父上下文，一次 pipeline 减少 RTT。
+
+        Args:
+            parent_ids: 去重后的 parent_id 列表。
+
+        Returns:
+            {parent_id: text | None} 字典，未命中或异常时 value 为 None。
+        """
+        if not self.client or not parent_ids:
+            return {}
+        try:
+            pipe = self.client.pipeline()
+            for pid in parent_ids:
+                pipe.get(f"rag:parent:{pid}")
+            values = pipe.execute()
+            return {
+                pid: (val.decode("utf-8") if isinstance(val, bytes) else val)
+                for pid, val in zip(parent_ids, values)
+            }
+        except Exception as e:
+            logger.error("Failed to batch get parent contexts: %s", e)
+            return {}
 
     def batch_save(self, items: Dict[str, str], expire_seconds: int = None):
         """

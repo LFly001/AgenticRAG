@@ -96,10 +96,18 @@ class SmartChunker:
                     }
                     all_chunks.append(chunk_obj)
 
-        # 【关键优化】批量保存父上下文到 Redis
+        # 【关键优化】批量保存父上下文到 Redis（带 TTL + 截断保护）
         if parent_contexts_to_save:
-            redis_store.batch_save(parent_contexts_to_save)
-            logger.info(f"Saved {len(parent_contexts_to_save)} parent contexts to Redis.")
+            max_chars = settings.PARENT_CONTEXT_MAX_CHARS
+            truncated = {
+                pid: (text if len(text) <= max_chars else text[:max_chars] + "\n... (内容过长已截断)")
+                for pid, text in parent_contexts_to_save.items()
+            }
+            redis_store.batch_save(truncated, expire_seconds=settings.PARENT_CONTEXT_TTL)
+            logger.info(
+                "Saved %d parent contexts to Redis (max_chars=%d, ttl=%ds).",
+                len(truncated), max_chars, settings.PARENT_CONTEXT_TTL,
+            )
 
         logger.info(f"Generated {len(all_chunks)} chunks from {len(parsed_docs)} elements.")
         return all_chunks

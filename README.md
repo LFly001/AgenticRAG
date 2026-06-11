@@ -39,7 +39,7 @@ orchestrator → intent → retriever → doc_filter → context_compress → re
 
 ```bash
 git clone <repo-url>
-cd MultiAgentRAG
+cd AgenticRAG
 ```
 
 ### 2. 配置 Docker 镜像加速（国内用户）

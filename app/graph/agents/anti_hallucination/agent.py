@@ -24,42 +24,25 @@
 
 from __future__ import annotations
 
-import json
 from typing import Dict, Any, List
 
-from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
 
-from app.config import settings
+from app.core.llm_factory import get_llm
 from app.graph.agents.anti_hallucination.state import AntiHallucinationState
+from app.utils.llm_utils import parse_llm_json
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 # ============================================================================
-# LLM
-# ============================================================================
-
-def _create_hallucination_llm() -> ChatOpenAI:
-    """幻觉检测 LLM — temperature=0，评审必须严格一致。"""
-    return ChatOpenAI(
-        model_name=settings.LLM_MODEL_NAME,
-        openai_api_key=settings.DEEPSEEK_API_KEY,
-        openai_api_base=settings.DEEPSEEK_BASE_URL,
-        temperature=0,
-        max_tokens=2048,
-        request_timeout=45,
-        max_retries=2,
-    )
-
-
-# ============================================================================
 # Prompt
 # ============================================================================
 
-VERIFY_AND_CORRECT_PROMPT = ChatPromptTemplate.from_template("""你是一个严格的答案质量审核专家。请逐句核查以下 AI 生成的答案，比对原始知识库文档，识别并修正任何幻觉（编造、篡改、虚假数据）。
+VERIFY_AND_CORRECT_PROMPT = ChatPromptTemplate.from_template(
+    """你是一个严格的答案质量审核专家。请逐句核查以下 AI 生成的答案，比对原始知识库文档，识别并修正任何幻觉（编造、篡改、虚假数据）。
 
 <用户问题>
 {question}
@@ -120,7 +103,7 @@ class AntiHallucinationAgent:
     """
 
     def __init__(self) -> None:
-        self._verify_llm = _create_hallucination_llm()
+        self._verify_llm = get_llm(temperature=0, max_tokens=2048, timeout=45)
 
     # ---- 节点 1: 核查 + 修正 ----
 
@@ -188,11 +171,7 @@ class AntiHallucinationAgent:
                 "valid_docs": valid_docs_text,
             })
             result_raw = response.content if hasattr(response, "content") else str(response)
-            result_raw = result_raw.strip()
-            if result_raw.startswith("```"):
-                result_raw = result_raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-
-            result = json.loads(result_raw)
+            result = parse_llm_json(result_raw)
             final_answer: str = result.get("final_answer", raw_answer)
             hallucination_risk: str = result.get("hallucination_risk", "none")
             issues_found: list = result.get("issues_found", [])
@@ -272,10 +251,4 @@ def build_anti_hallucination_agent():
     workflow.add_edge("finalize", END)
 
     compiled = workflow.compile()
-
-    logger.info(
-        "AntiHallucinationAgent subgraph compiled (terminal). "
-        "Topology: START → verify_and_correct → finalize → END"
-    )
-
     return compiled

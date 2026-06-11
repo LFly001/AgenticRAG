@@ -27,42 +27,25 @@
 
 from __future__ import annotations
 
-import json
 from typing import Dict, Any
 
-from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
 
-from app.config import settings
+from app.core.llm_factory import get_llm
 from app.graph.agents.reason.state import ReasonState
+from app.utils.llm_utils import parse_llm_json
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 # ============================================================================
-# LLM
-# ============================================================================
-
-def _create_reason_llm() -> ChatOpenAI:
-    """推理 LLM — temperature=0.1，给 CoT 留一点多样性空间。"""
-    return ChatOpenAI(
-        model_name=settings.LLM_MODEL_NAME,
-        openai_api_key=settings.DEEPSEEK_API_KEY,
-        openai_api_base=settings.DEEPSEEK_BASE_URL,
-        temperature=0.1,
-        max_tokens=2048,
-        request_timeout=45,
-        max_retries=2,
-    )
-
-
-# ============================================================================
 # Prompt
 # ============================================================================
 
-COT_REASON_PROMPT = ChatPromptTemplate.from_template("""你是一个严谨的逻辑推理专家。请基于提供的上下文信息，对用户问题进行链式推理（Chain-of-Thought），搭建答案的逻辑框架。
+COT_REASON_PROMPT = ChatPromptTemplate.from_template(
+    """你是一个严谨的逻辑推理专家。请基于提供的上下文信息，对用户问题进行链式推理（Chain-of-Thought），搭建答案的逻辑框架。
 
 <用户问题>
 {question}
@@ -134,7 +117,7 @@ class ReasonAgent:
     """
 
     def __init__(self) -> None:
-        self._reason_llm = _create_reason_llm()
+        self._reason_llm = get_llm(temperature=0.1, max_tokens=2048, timeout=45)
 
     # ---- 节点 1: CoT 推理 ----
 
@@ -170,11 +153,7 @@ class ReasonAgent:
                 "conflict_note": conflict_note or "（无冲突）",
             })
             raw = response.content if hasattr(response, "content") else str(response)
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-
-            result = json.loads(raw)
+            result = parse_llm_json(raw)
             reasoning_draft: str = result.get("reasoning_draft", "")
             need_reretrieve: bool = bool(result.get("need_reretrieve", False))
             re_retrieve_queries: list = result.get("re_retrieve_queries", [])
@@ -255,10 +234,4 @@ def build_reason_agent():
     workflow.add_edge("finalize", END)
 
     compiled = workflow.compile()
-
-    logger.info(
-        "ReasonAgent subgraph compiled. "
-        "Topology: START → cot_reason → finalize → END"
-    )
-
     return compiled

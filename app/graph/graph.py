@@ -65,32 +65,13 @@ def build_graph(retriever=None):
         编译后的 CompiledGraph
     """
     # ── 构建 8 个子图 ──
-    logger.info("=" * 50)
-    logger.info("Building 8-Agent collaboration graph...")
-    logger.info("=" * 50)
-
-    logger.info("[1/8] OrchestratorAgent")
     orchestrator_graph = build_orchestrator_agent()
-
-    logger.info("[2/8] IntentAgent")
     intent_graph = build_intent_agent()
-
-    logger.info("[3/8] RetrieveAgent")
     retriever_graph = build_retriever_agent(retriever)
-
-    logger.info("[4/8] DocFilterAgent")
     doc_filter_graph = build_doc_filter_agent()
-
-    logger.info("[5/8] ContextCompressAgent")
     context_compress_graph = build_context_compress_agent()
-
-    logger.info("[6/8] ReasonAgent")
     reason_graph = build_reason_agent()
-
-    logger.info("[7/8] WriterAgent")
     writer_graph = build_writer_agent()
-
-    logger.info("[8/8] AntiHallucinationAgent")
     anti_hallucination_graph = build_anti_hallucination_agent()
 
     # ── 组装父图 ──
@@ -132,15 +113,7 @@ def build_graph(retriever=None):
     workflow.add_conditional_edges("anti_hallucination_agent", route_dispatcher, route_map)
 
     compiled = workflow.compile()
-
-    logger.info("=" * 50)
-    logger.info(
-        "8-Agent graph compiled (recursion_limit=50). "
-        "Topology: orchestrator → intent → [route_dispatcher ↔ 6 agents] → END"
-    )
-    logger.info("Entry: orchestrator")
-    logger.info("=" * 50)
-
+    logger.info("8-Agent graph compiled.")
     return compiled
 
 
@@ -158,40 +131,15 @@ def _make_node(subgraph, node_name: str):
     """
 
     async def _node(state: GraphState):
-        logger.debug("[Graph] Entering node: %s", node_name)
-
         # 构建子图输入（从父图 state 中选取相关字段）
         sub_input = _build_subgraph_input(state, node_name)
-
-        # 诊断：关键数据节点记录输入大小
-        if node_name == "retriever_agent":
-            logger.info("[Graph.Pipe] retriever IN  raw_docs=%d", len(state.get("raw_docs", [])))
-        elif node_name == "doc_filter_agent":
-            logger.info("[Graph.Pipe] doc_filter IN  raw_docs=%d", len(state.get("raw_docs", [])))
-        elif node_name == "context_compress_agent":
-            logger.info("[Graph.Pipe] ctx_compress IN valid_docs=%d", len(state.get("valid_docs", [])))
-        elif node_name == "reason_agent":
-            logger.info("[Graph.Pipe] reason IN compressed_context=%d chars", len(state.get("compressed_context", "") or ""))
 
         # 调用子图
         sub_result = await subgraph.ainvoke(sub_input)
 
-        # 诊断：输出大小
-        if node_name == "retriever_agent":
-            logger.info("[Graph.Pipe] retriever OUT raw_docs=%d", len(sub_result.get("raw_docs", [])))
-        elif node_name == "doc_filter_agent":
-            logger.info("[Graph.Pipe] doc_filter OUT valid_docs=%d", len(sub_result.get("valid_docs", [])))
-        elif node_name == "context_compress_agent":
-            ctx = sub_result.get("compressed_context", "") or ""
-            logger.info("[Graph.Pipe] ctx_compress OUT compressed_context=%d chars", len(ctx))
-        elif node_name == "reason_agent":
-            logger.info("[Graph.Pipe] reason OUT reretrieve=%s", sub_result.get("need_reretrieve", False))
-
         # 合并输出
         merged = _merge_subgraph_output(state, sub_result, node_name)
 
-        logger.debug("[Graph] Exiting node: %s, route_action=%s",
-                      node_name, merged.get("route_action", "?"))
         return merged
 
     return _node
@@ -214,13 +162,16 @@ def _build_subgraph_input(state: GraphState, node_name: str) -> dict:
     if node_name == "orchestrator":
         extras.update({
             "session_id": state.get("session_id", ""),
-            "chat_history": state.get("chat_history", []),
         })
 
     elif node_name == "intent_agent":
+        # chat_history 仅 intent_agent 需要（指代消解），
+        # 直接从 conv_store 读取，不经过 GraphState 全局传递
+        from app.stores.session_store import conv_store
+        sid = state.get("session_id", "")
         extras.update({
             "user_query": state.get("question", ""),
-            "chat_history": state.get("chat_history", []),
+            "chat_history": conv_store.get_history(sid) if sid else [],
         })
 
     elif node_name == "retriever_agent":
@@ -249,6 +200,7 @@ def _build_subgraph_input(state: GraphState, node_name: str) -> dict:
         extras.update({
             "compressed_context": state.get("compressed_context", ""),
             "reasoning_draft": state.get("reasoning_draft", ""),
+            "retrieval_details": state.get("retrieval_details", {}),
         })
 
     elif node_name == "anti_hallucination_agent":
@@ -272,14 +224,21 @@ def _merge_subgraph_output(state: GraphState, sub_result: dict, node_name: str) 
     merged: dict = {}
 
     # agent_log → node_log 转换
+    # 注意：agent_log 已包含旧条目（_build_subgraph_input 从 node_log 复制）
+    # 所以直接使用 sub_log，不再叠加 old_log，避免重复
     sub_log = sub_result.get("agent_log", [])
     if sub_log:
-        old_log = list(state.get("node_log", []))
-        merged["node_log"] = old_log + sub_log
+        merged["node_log"] = sub_log
 
     # 所有非 agent_log 字段，按非空规则合并
+    # 跳过内部字段（_ 前缀）和子图专用字段
+    _INTERNAL_KEYS = {"resolved_query"}
     for key, value in sub_result.items():
         if key == "agent_log":
+            continue
+        if key.startswith("_"):
+            continue
+        if key in _INTERNAL_KEYS:
             continue
         if value is None:
             continue

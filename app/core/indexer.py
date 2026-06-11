@@ -157,10 +157,46 @@ class IndexingMixin:
         except Exception as e:
             logger.error("Failed to rebuild BM25S after deletion: %s", e)
 
+    # ---- document summary cache ----
+
+    def _build_doc_summary_from_db(self):
+        """启动时从 ChromaDB 全量构建文档摘要缓存（仅执行一次）。"""
+        try:
+            all_data = self.collection.get(include=["metadatas"])
+            metadatas = all_data.get("metadatas", [])
+
+            self._doc_summary.clear()
+            for meta in (metadatas or []):
+                if isinstance(meta, dict):
+                    source = meta.get("source_file", "unknown")
+                    self._doc_summary[source] = self._doc_summary.get(source, 0) + 1
+
+            logger.info(
+                "Doc summary built: %d documents, %d chunks.",
+                len(self._doc_summary),
+                sum(self._doc_summary.values()),
+            )
+        except Exception as e:
+            logger.warning("Failed to build doc summary from DB: %s", e)
+            self._doc_summary = {}
+
     # ---- public API ----
 
-    async def delete_documents_by_source(self, source_file: str):
-        """根据文件名删除相关 Chunks、Redis Parent Contexts，并重建 BM25 索引。"""
+    async def list_all_documents(self) -> List[Dict[str, Any]]:
+        """列出知识库中所有文档（从内存缓存读取，零延迟）。"""
+        result = [
+            {"filename": filename, "chunk_count": count}
+            for filename, count in sorted(
+                self._doc_summary.items(), key=lambda x: x[1], reverse=True
+            )
+        ]
+        logger.info("Listed %d unique documents from cache.", len(result))
+        return result
+
+    async def delete_documents_by_source(self, source_file: str) -> int:
+        """根据文件名删除相关 Chunks、Redis Parent Contexts，并重建 BM25 索引。
+        返回删除的切片数量。
+        """
         logger.info("Starting deletion for source: %s", source_file)
         loop = asyncio.get_running_loop()
 
@@ -173,12 +209,13 @@ class IndexingMixin:
 
             ids_to_delete = set(result['ids'])
             metadatas = result['metadatas']
+            deleted_count = len(ids_to_delete)
 
             if not ids_to_delete:
                 logger.info(
                     "No documents found for %s. Nothing to delete.", source_file
                 )
-                return
+                return 0
 
             # 2. 提取 Parent IDs 并从 Redis 删除
             parent_ids_to_delete = set()
@@ -201,7 +238,7 @@ class IndexingMixin:
                 lambda: self.collection.delete(ids=list(ids_to_delete)),
             )
             logger.info(
-                "Deleted %d chunks from ChromaDB.", len(ids_to_delete)
+                "Deleted %d chunks from ChromaDB.", deleted_count
             )
 
             # 4. 增量重建 BM25S 索引
@@ -210,9 +247,13 @@ class IndexingMixin:
                     None, self._rebuild_bm25s_after_deletion, ids_to_delete
                 )
 
+            # 5. 从文档摘要缓存中移除
+            self._doc_summary.pop(source_file, None)
+
             logger.info(
                 "Successfully deleted and rebuilt index for %s.", source_file
             )
+            return deleted_count
 
         except Exception as e:
             logger.error(
@@ -225,6 +266,8 @@ class IndexingMixin:
         """异步添加文档到 ChromaDB 向量库和 BM25 索引。"""
         if not chunks:
             return
+
+        await self._ensure_models()  # 懒加载触发（若未加载）
 
         ids = [chunk["id"] for chunk in chunks]
         texts = [chunk["text"] for chunk in chunks]
@@ -253,5 +296,10 @@ class IndexingMixin:
             await loop.run_in_executor(
                 None, self._add_to_bm25s_index_incremental, texts, ids
             )
+
+        # 更新文档摘要缓存
+        for chunk in chunks:
+            source = chunk.get("metadata", {}).get("source_file", "unknown")
+            self._doc_summary[source] = self._doc_summary.get(source, 0) + 1
 
         logger.info("Successfully indexed %d chunks.", len(chunks))

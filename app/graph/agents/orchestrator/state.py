@@ -1,6 +1,6 @@
 """OrchestratorAgent 子图状态 — 总调度节点的独立状态空间。"""
 
-from typing import TypedDict, List, Dict, Any
+from typing import TypedDict, List, Dict
 
 
 class OrchestratorState(TypedDict, total=False):
@@ -13,7 +13,7 @@ class OrchestratorState(TypedDict, total=False):
     - chat_history: 对话历史
     - trace_id: 全链路追踪 ID（本节点初始化）
     - route_action: 路由跳转标记（本节点设置为 "intent_agent"）
-    - node_log: 执行日志
+    - agent_log: 执行日志
     """
 
     question: str
@@ -22,4 +22,4 @@ class OrchestratorState(TypedDict, total=False):
     chat_history: List[Dict[str, str]]
     trace_id: str
     route_action: str
-    node_log: List[str]
+    agent_log: List[str]

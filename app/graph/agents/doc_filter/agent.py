@@ -24,16 +24,16 @@
 
 from __future__ import annotations
 
-import json
+import hashlib
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
-from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
 
-from app.config import settings
+from app.core.llm_factory import get_llm
 from app.graph.agents.doc_filter.state import DocFilterState
+from app.utils.llm_utils import parse_llm_json
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -42,7 +42,7 @@ logger = get_logger(__name__)
 # 过滤阈值常量
 # ============================================================================
 
-MIN_TEXT_LENGTH = 20          # 最小文本长度（字符），低于此值视为碎片
+MIN_TEXT_LENGTH = 10          # 最小文本长度（字符），低于此值视为碎片
 MIN_RRF_SCORE = 0.0           # 最低 RRF 分数阈值（仅 reranker 不可用时启用）
 
 # 时效相关元数据键名（按优先级）
@@ -54,23 +54,6 @@ PUBLISH_DATE_KEYS = [
     "publish_date", "pub_date", "created_date", "date",
     "effective_date", "start_date",
 ]
-
-
-# ============================================================================
-# LLM
-# ============================================================================
-
-def _create_filter_llm() -> ChatOpenAI:
-    """冲突检测 LLM — temperature=0。"""
-    return ChatOpenAI(
-        model_name=settings.LLM_MODEL_NAME,
-        openai_api_key=settings.DEEPSEEK_API_KEY,
-        openai_api_base=settings.DEEPSEEK_BASE_URL,
-        temperature=0,
-        max_tokens=512,
-        request_timeout=25,
-        max_retries=2,
-    )
 
 
 # ============================================================================
@@ -116,7 +99,7 @@ class DocFilterAgent:
     """
 
     def __init__(self) -> None:
-        self._conflict_llm = _create_filter_llm()
+        self._conflict_llm = get_llm(temperature=0, max_tokens=512, timeout=25)
 
     # ---- 节点 1: 规则过滤 ----
 
@@ -146,6 +129,10 @@ class DocFilterAgent:
             # 空文本 / 碎片
             if len(text) < MIN_TEXT_LENGTH:
                 removed_empty += 1
+                logger.info(
+                    "[DocFilter] Drop short chunk id=%s len=%d text=%.50s",
+                    doc.get("id", "?")[:40], len(text), text,
+                )
                 continue
             # 分数阈值（仅 reranker 不可用时用 RRF 兜底，0.0 基本不滤）
             if doc.get("rerank_score") is None:
@@ -164,11 +151,11 @@ class DocFilterAgent:
             stage2.append(doc)
 
         # --- 第三轮：文本去重（前 200 字符 hash） ---
-        seen_hashes: set[int] = set()
+        seen_hashes: set[str] = set()
         stage3: List[Dict[str, Any]] = []
         for doc in stage2:
             text = (doc.get("text", "") or "").strip()
-            h = hash(text[:200])
+            h = hashlib.md5(text[:200].encode('utf-8')).hexdigest()
             if h in seen_hashes:
                 removed_dup += 1
                 continue
@@ -243,11 +230,7 @@ class DocFilterAgent:
                 "documents": "\n\n".join(doc_summaries),
             })
             raw = response.content if hasattr(response, "content") else str(response)
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-
-            result = json.loads(raw)
+            result = parse_llm_json(raw)
             has_conflict = bool(result.get("has_conflict", False))
             conflict_note = result.get("conflict_note", "")
 
@@ -346,10 +329,4 @@ def build_doc_filter_agent():
     workflow.add_edge("detect_conflicts", END)
 
     compiled = workflow.compile()
-
-    logger.info(
-        "DocFilterAgent subgraph compiled. "
-        "Topology: START → filter_docs → detect_conflicts → END"
-    )
-
     return compiled

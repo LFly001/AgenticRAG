@@ -31,3 +31,22 @@ class QueryResponse(BaseModel):
     retrieval_details: RetrievalDetails
     thought_process: list[str] = []
     session_id: str = ""
+
+
+class DocumentInfo(BaseModel):
+    """知识库文档摘要信息。"""
+    filename: str
+    chunk_count: int
+
+
+class DocumentListResponse(BaseModel):
+    """文档列表响应。"""
+    documents: list[DocumentInfo]
+    total_chunks: int
+
+
+class DeleteResponse(BaseModel):
+    """删除操作响应。"""
+    success: bool
+    message: str
+    deleted_chunks: int = 0
